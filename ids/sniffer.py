@@ -43,6 +43,7 @@ def sniff_events(iface: str | None = None, packet_count: int = 100) -> list[Even
                 dst_port=dst_port,
                 size=len(packet),
                 event_type="packet",
+                outcome="unknown",
             )
         )
 

@@ -1,95 +1,161 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 from pathlib import Path
 
+from ids.config import IDSConfig, load_config
 from ids.detector import IntrusionDetector
-from ids.models import Event
-from ids.sniffer import sniff_events
-
-
-def load_events(path: Path) -> list[Event]:
-    events: list[Event] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-                events.append(Event.from_dict(payload))
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"Skipping invalid record at line {line_number}: {exc}",
-                    file=sys.stderr,
-                )
-    return events
-
-
-def print_alerts(alerts) -> None:
-    if not alerts:
-        print("No alerts detected.")
-        return
-
-    print("Alerts:")
-    for alert in alerts:
-        print(
-            f"[{alert.severity}] {alert.rule_name}: "
-            f"{alert.description} "
-            f"(src={alert.src_ip}, time={alert.timestamp.isoformat()})"
-        )
+from ids.ingest import EventLoader
+from ids.monitor import IDSMonitor
+from ids.responders import ResponderPipeline
+from ids.storage import AlertStore
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Starter intrusion detection system")
+    parser = argparse.ArgumentParser(
+        description="Intrusion Detection System with monitoring, storage, and dashboard"
+    )
     parser.add_argument(
-        "--input",
+        "--config",
         type=Path,
-        help="Path to JSONL events file for offline analysis",
+        default=Path("config/ids_config.json"),
+        help="Path to IDS configuration file",
     )
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Capture live traffic using scapy",
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    analyze = subparsers.add_parser("analyze", help="Analyze an event file once")
+    analyze.add_argument("--input", type=Path, required=True, help="Path to log file")
+    analyze.add_argument(
+        "--format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="Input format",
     )
-    parser.add_argument(
-        "--interface",
-        default=None,
-        help="Network interface for live capture",
+
+    monitor = subparsers.add_parser(
+        "monitor",
+        help="Continuously monitor an event file or live interface",
     )
-    parser.add_argument(
+    monitor.add_argument("--input", type=Path, help="Path to log file to tail")
+    monitor.add_argument(
+        "--format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="Input format for --input",
+    )
+    monitor.add_argument("--live", action="store_true", help="Capture live traffic")
+    monitor.add_argument("--interface", default=None, help="Network interface")
+    monitor.add_argument(
         "--packet-count",
         type=int,
         default=100,
-        help="Maximum number of live packets to capture",
+        help="Packets per live capture cycle",
     )
+    monitor.add_argument(
+        "--cycles",
+        type=int,
+        default=None,
+        help="Optional number of monitor cycles before exiting",
+    )
+
+    dashboard = subparsers.add_parser("dashboard", help="Run the web dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1", help="Dashboard host")
+    dashboard.add_argument("--port", type=int, default=5000, help="Dashboard port")
+    dashboard.add_argument("--debug", action="store_true", help="Enable debug mode")
+
     return parser
+
+
+def create_runtime(
+    config: IDSConfig,
+) -> tuple[IntrusionDetector, AlertStore, EventLoader, ResponderPipeline]:
+    detector = IntrusionDetector(config)
+    store = AlertStore(config.storage.database_path)
+    loader = EventLoader()
+    responders = ResponderPipeline.from_config(config)
+    return detector, store, loader, responders
+
+
+def command_analyze(config: IDSConfig, input_path: Path, input_format: str) -> int:
+    detector, store, loader, responders = create_runtime(config)
+    events = loader.load_file(input_path, input_format)
+    alerts = detector.process_events(events)
+    stored_count = store.save_alerts(alerts)
+    responders.handle(alerts)
+
+    if not alerts:
+        print("No alerts detected.")
+        return 0
+
+    print(f"Detected {len(alerts)} alert(s). Stored {stored_count} new alert(s).")
+    for alert in alerts:
+        print(
+            f"[{alert.severity}] {alert.rule_name}: {alert.description} "
+            f"(src={alert.src_ip}, dst={alert.dst_ip}, time={alert.timestamp.isoformat()})"
+        )
+    return 0
+
+
+def command_monitor(
+    config: IDSConfig,
+    input_path: Path | None,
+    input_format: str,
+    live: bool,
+    interface: str | None,
+    packet_count: int,
+    cycles: int | None,
+) -> int:
+    detector, store, loader, responders = create_runtime(config)
+    monitor = IDSMonitor(
+        config=config,
+        detector=detector,
+        store=store,
+        loader=loader,
+        responders=responders,
+    )
+    monitor.run(
+        input_path=input_path,
+        input_format=input_format,
+        live=live,
+        interface=interface,
+        packet_count=packet_count,
+        cycles=cycles,
+    )
+    return 0
+
+
+def command_dashboard(config: IDSConfig, host: str, port: int, debug: bool) -> int:
+    from ids.web import run_dashboard
+
+    _, store, _, _ = create_runtime(config)
+    run_dashboard(config=config, store=store, host=host, port=port, debug=debug)
+    return 0
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    config = load_config(args.config)
 
-    detector = IntrusionDetector()
+    if args.command == "analyze":
+        return command_analyze(config, args.input, args.format)
 
-    if args.input:
-        events = load_events(args.input)
-        alerts = detector.process_events(events)
-        print_alerts(alerts)
-        return 0
+    if args.command == "monitor":
+        if not args.input and not args.live:
+            parser.error("monitor requires either --input or --live")
+        return command_monitor(
+            config=config,
+            input_path=args.input,
+            input_format=args.format,
+            live=args.live,
+            interface=args.interface,
+            packet_count=args.packet_count,
+            cycles=args.cycles,
+        )
 
-    if args.live:
-        try:
-            events = sniff_events(iface=args.interface, packet_count=args.packet_count)
-        except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-
-        alerts = detector.process_events(events)
-        print_alerts(alerts)
-        return 0
+    if args.command == "dashboard":
+        return command_dashboard(config, args.host, args.port, args.debug)
 
     parser.print_help()
     return 1

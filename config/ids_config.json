@@ -1,0 +1,28 @@
+{
+  "detection": {
+    "window_seconds": 60,
+    "suspicious_ports": [23, 445, 3389, 4444],
+    "port_scan_threshold": 10,
+    "failed_login_threshold": 5,
+    "traffic_burst_threshold": 20,
+    "allowlisted_ips": ["127.0.0.1", "::1"]
+  },
+  "storage": {
+    "database_path": "data/alerts.jsonl"
+  },
+  "monitoring": {
+    "poll_interval_seconds": 5
+  },
+  "dashboard": {
+    "username": "admin",
+    "password_hash": "4e7a94a1b8ac55d23c40cd3ce4c4d0e670add71b012de74799ae71c5715de547",
+    "password_salt": "ids-demo-salt",
+    "secret_key": "change-this-secret-key"
+  },
+  "response": {
+    "auto_block_enabled": false,
+    "block_on_high_severity": true,
+    "block_command_mode": "simulate",
+    "blocked_ips": []
+  }
+}
