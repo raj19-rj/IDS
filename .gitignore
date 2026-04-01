@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 data/
+tests/.tmp_detector/
+tests/.tmp_storage/
+tests/__pycache__/
+ids/__pycache__/

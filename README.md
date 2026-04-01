@@ -7,7 +7,7 @@ It now supports:
 - Offline analysis from JSONL and CSV event files
 - Continuous monitoring mode for tailed log files
 - Optional live packet capture with `scapy`
-- Persistent alert storage with SQLite
+- Persistent alert storage with JSONL
 - Authenticated web dashboard
 - Configurable thresholds and allowlists
 - Optional automated IP blocking response
@@ -26,8 +26,8 @@ It now supports:
 - `ids/ingest.py` - JSONL and CSV loaders
 - `ids/monitor.py` - continuous monitoring loop
 - `ids/responders.py` - optional automated response actions
-- `ids/storage.py` - SQLite persistence
-- `ids/web.py` - Flask dashboard
+- `ids/storage.py` - JSONL alert persistence
+- `ids/web.py` - built-in dashboard server
 - `ids/sniffer.py` - optional live capture support
 - `tests/` - basic unit tests
 - `sample_data/events.jsonl` - sample traffic events for testing
