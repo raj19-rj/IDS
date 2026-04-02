@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import hashlib
 
 
@@ -8,4 +9,4 @@ def hash_password(password: str, salt: str) -> str:
 
 
 def verify_password(password: str, salt: str, password_hash: str) -> bool:
-    return hash_password(password, salt) == password_hash
+    return hmac.compare_digest(hash_password(password, salt), password_hash)

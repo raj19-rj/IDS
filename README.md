@@ -87,7 +87,21 @@ Default login:
 - Username: `admin`
 - Password: `admin123`
 
-Change the dashboard credentials in `config/ids_config.json` before using this anywhere real.
+For safer local use, override them with environment variables before starting the dashboard:
+
+```powershell
+$env:IDS_DASHBOARD_PASSWORD="your-strong-password"
+$env:IDS_SECRET_KEY="your-long-random-secret"
+python main.py dashboard
+```
+
+Supported overrides:
+
+- `IDS_DASHBOARD_USERNAME`
+- `IDS_DASHBOARD_PASSWORD`
+- `IDS_DASHBOARD_PASSWORD_HASH`
+- `IDS_DASHBOARD_PASSWORD_SALT`
+- `IDS_SECRET_KEY`
 
 ## Input Format
 
@@ -139,6 +153,6 @@ python -m unittest discover -s tests
 ## Notes On Production Readiness
 
 - This is now a stronger MVP, but it still needs hardening before production.
-- Replace the demo dashboard secret and password hash.
+- Replace the demo dashboard password and secret key.
 - Firewall automation may require administrator rights.
 - For enterprise use, add stronger auth, HTTPS, audit logs, and integrations with real network devices.

@@ -7,7 +7,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
-from ids.config import IDSConfig
+from ids.config import DEFAULT_DASHBOARD_PASSWORD_HASH, IDSConfig
 from ids.security import verify_password
 from ids.storage import AlertStore
 
@@ -233,6 +233,11 @@ def run_dashboard(
     debug: bool,
 ) -> None:
     _ = debug
+    if config.dashboard.password_hash == DEFAULT_DASHBOARD_PASSWORD_HASH:
+        print(
+            "Warning: dashboard is using the demo password. "
+            "Set IDS_DASHBOARD_PASSWORD or IDS_DASHBOARD_PASSWORD_HASH before deployment."
+        )
     server = create_server(config=config, store=store, host=host, port=port)
     print(f"Dashboard running on http://{host}:{port}")
     server.serve_forever()

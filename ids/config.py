@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
+
+from ids.security import hash_password
 
 
 @dataclass(slots=True)
@@ -79,12 +83,48 @@ DEFAULT_CONFIG = {
     },
 }
 
+DEFAULT_DASHBOARD_PASSWORD = "admin123"
+DEFAULT_DASHBOARD_PASSWORD_HASH = hash_password(
+    DEFAULT_DASHBOARD_PASSWORD,
+    DEFAULT_CONFIG["dashboard"]["password_salt"],
+)
+
 
 def ensure_config_file(path: Path) -> None:
     if path.exists():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+
+
+def _env_or_default(name: str, fallback: str) -> str:
+    return os.getenv(name, fallback)
+
+
+def _build_dashboard_config(raw_dashboard: dict) -> DashboardConfig:
+    username = _env_or_default("IDS_DASHBOARD_USERNAME", str(raw_dashboard["username"]))
+    password_salt = _env_or_default(
+        "IDS_DASHBOARD_PASSWORD_SALT",
+        str(raw_dashboard["password_salt"]),
+    )
+    password_hash = _env_or_default(
+        "IDS_DASHBOARD_PASSWORD_HASH",
+        str(raw_dashboard["password_hash"]),
+    )
+    password_plain = os.getenv("IDS_DASHBOARD_PASSWORD")
+    if password_plain:
+        password_hash = hash_password(password_plain, password_salt)
+
+    secret_key = _env_or_default("IDS_SECRET_KEY", str(raw_dashboard["secret_key"]))
+    if secret_key == "change-this-secret-key":
+        secret_key = secrets.token_hex(32)
+
+    return DashboardConfig(
+        username=username,
+        password_hash=password_hash,
+        password_salt=password_salt,
+        secret_key=secret_key,
+    )
 
 
 def load_config(path: Path) -> IDSConfig:
@@ -103,12 +143,7 @@ def load_config(path: Path) -> IDSConfig:
         monitoring=MonitoringConfig(
             poll_interval_seconds=int(raw["monitoring"]["poll_interval_seconds"])
         ),
-        dashboard=DashboardConfig(
-            username=str(raw["dashboard"]["username"]),
-            password_hash=str(raw["dashboard"]["password_hash"]),
-            password_salt=str(raw["dashboard"]["password_salt"]),
-            secret_key=str(raw["dashboard"]["secret_key"]),
-        ),
+        dashboard=_build_dashboard_config(raw["dashboard"]),
         response=ResponseConfig(
             auto_block_enabled=bool(raw["response"]["auto_block_enabled"]),
             block_on_high_severity=bool(raw["response"]["block_on_high_severity"]),
