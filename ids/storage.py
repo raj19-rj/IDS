@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from collections import Counter
 from pathlib import Path
@@ -58,6 +59,35 @@ class AlertStore:
             "severity_counts": dict(severity_counts),
             "top_sources": top_sources,
         }
+
+    def export_alerts(self, output_path: Path, export_format: str) -> int:
+        rows = self._read_all()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if export_format == "json":
+            output_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+            return len(rows)
+
+        if export_format == "csv":
+            with output_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "timestamp",
+                        "severity",
+                        "rule_name",
+                        "description",
+                        "src_ip",
+                        "dst_ip",
+                        "metadata_json",
+                        "fingerprint",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            return len(rows)
+
+        raise ValueError(f"Unsupported export format: {export_format}")
 
     def _read_all(self) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []

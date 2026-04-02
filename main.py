@@ -64,6 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, default=5000, help="Dashboard port")
     dashboard.add_argument("--debug", action="store_true", help="Enable debug mode")
 
+    export = subparsers.add_parser("export", help="Export stored alerts")
+    export.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination file path",
+    )
+    export.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        required=True,
+        help="Export format",
+    )
+
     return parser
 
 
@@ -133,6 +147,13 @@ def command_dashboard(config: IDSConfig, host: str, port: int, debug: bool) -> i
     return 0
 
 
+def command_export(config: IDSConfig, output_path: Path, export_format: str) -> int:
+    _, store, _, _ = create_runtime(config)
+    exported_count = store.export_alerts(output_path=output_path, export_format=export_format)
+    print(f"Exported {exported_count} alert(s) to {output_path}")
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -156,6 +177,9 @@ def main() -> int:
 
     if args.command == "dashboard":
         return command_dashboard(config, args.host, args.port, args.debug)
+
+    if args.command == "export":
+        return command_export(config, args.output, args.format)
 
     parser.print_help()
     return 1

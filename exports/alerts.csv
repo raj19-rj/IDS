@@ -1,0 +1,7 @@
+timestamp,severity,rule_name,description,src_ip,dst_ip,metadata_json,fingerprint
+2026-04-01T10:00:20,HIGH,Brute Force Login,5 failed login events observed in 60 seconds,10.0.0.5,10.0.0.10,"{""failed_logins"": ""5""}",583553b52233c60dcefaca48e6275f875add6ff974f433da3fa65856c3c6c704
+2026-04-01T10:01:00,HIGH,Port Scan,Source touched 11 unique destination ports in 60 seconds,10.0.0.8,10.0.0.20,"{""unique_ports"": ""11""}",9aecae737be281d116acfa43a4ea829fa30ece20358d3b5f93bcd1f88a57f1d9
+2026-04-01T10:01:04,MEDIUM,Suspicious Port Access,Traffic sent to suspicious port 23,10.0.0.8,10.0.0.20,"{""port"": ""23""}",9bbf5c5a038990bdbd3ba1df95f4b0a6da92071942e0becfa1a62d3a02f40fdb
+2026-04-01T10:01:18,MEDIUM,Suspicious Port Access,Traffic sent to suspicious port 445,10.0.0.8,10.0.0.20,"{""port"": ""445""}",32b020964ce92e0afa1fae0d8fbe84206314f1109be5e5c11d00ad175ac5f052
+2026-04-01T10:01:20,MEDIUM,Suspicious Port Access,Traffic sent to suspicious port 3389,10.0.0.8,10.0.0.20,"{""port"": ""3389""}",47844bfe4c874488fa1a6afa861240f1cfe4b07b3924ef4681de675719301df5
+2026-04-01T10:02:00,MEDIUM,Traffic Burst,20 events and 1600 bytes observed in 60 seconds,10.0.0.9,10.0.0.30,"{""bytes"": ""1600"", ""event_count"": ""20""}",e649288ed80a939a045e39f336d5ec2fe35cc7f7dba6c8bc3459895c62d9895e

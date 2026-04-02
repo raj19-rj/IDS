@@ -103,6 +103,20 @@ Supported overrides:
 - `IDS_DASHBOARD_PASSWORD_SALT`
 - `IDS_SECRET_KEY`
 
+## Export Alerts
+
+Export stored alerts to CSV:
+
+```bash
+python main.py export --format csv --output exports/alerts.csv
+```
+
+Export stored alerts to JSON:
+
+```bash
+python main.py export --format json --output exports/alerts.json
+```
+
 ## Input Format
 
 Each line in the JSONL file should be a JSON object like this:

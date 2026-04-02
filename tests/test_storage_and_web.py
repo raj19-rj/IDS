@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from uuid import uuid4
 from datetime import datetime
 from pathlib import Path
@@ -70,6 +71,26 @@ class StorageAndWebTests(unittest.TestCase):
         server = create_server(self.config, self.store, host="127.0.0.1", port=0)
         self.assertIsNotNone(server)
         server.server_close()
+
+    def test_export_alerts_to_json(self) -> None:
+        alert = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 0, 0),
+            severity="HIGH",
+            rule_name="Port Scan",
+            description="scan",
+            src_ip="1.2.3.4",
+            dst_ip="10.0.0.10",
+            metadata={"x": "1"},
+        )
+        self.store.save_alerts([alert])
+        export_path = self.workspace / f"{uuid4().hex}.json"
+
+        exported_count = self.store.export_alerts(export_path, "json")
+
+        self.assertEqual(exported_count, 1)
+        exported_rows = json.loads(export_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(exported_rows), 1)
+        self.assertEqual(exported_rows[0]["src_ip"], "1.2.3.4")
 
 
 if __name__ == "__main__":
