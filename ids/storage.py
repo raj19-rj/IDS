@@ -46,12 +46,26 @@ class AlertStore:
         limit: int = 100,
         severity: str | None = None,
         src_ip: str | None = None,
+        rule_name: str | None = None,
+        search: str | None = None,
     ) -> list[dict[str, object]]:
         rows = self._read_all()
         if severity:
             rows = [row for row in rows if row["severity"] == severity]
         if src_ip:
             rows = [row for row in rows if row["src_ip"] == src_ip]
+        if rule_name:
+            rows = [row for row in rows if row["rule_name"] == rule_name]
+        if search:
+            query = search.lower()
+            rows = [
+                row
+                for row in rows
+                if query in row["description"].lower()
+                or query in row["src_ip"].lower()
+                or query in row["dst_ip"].lower()
+                or query in row["rule_name"].lower()
+            ]
         rows.sort(key=lambda row: row["timestamp"], reverse=True)
         return rows[:limit]
 
@@ -59,6 +73,7 @@ class AlertStore:
         rows = self._read_all()
         severity_counts = Counter(row["severity"] for row in rows)
         source_counts = Counter(row["src_ip"] for row in rows)
+        rule_counts = Counter(row["rule_name"] for row in rows)
         top_sources = [
             {"src_ip": src_ip, "count": count}
             for src_ip, count in source_counts.most_common(5)
@@ -67,6 +82,27 @@ class AlertStore:
             "total_alerts": len(rows),
             "severity_counts": dict(severity_counts),
             "top_sources": top_sources,
+            "top_rules": [
+                {"rule_name": rule_name, "count": count}
+                for rule_name, count in rule_counts.most_common(5)
+            ],
+        }
+
+    def get_alert(self, fingerprint: str) -> dict[str, object] | None:
+        for row in self._read_all():
+            if row["fingerprint"] == fingerprint:
+                return row
+        return None
+
+    def distinct_values(self) -> dict[str, list[str]]:
+        rows = self._read_all()
+        severities = sorted({str(row["severity"]) for row in rows})
+        source_ips = sorted({str(row["src_ip"]) for row in rows})
+        rules = sorted({str(row["rule_name"]) for row in rows})
+        return {
+            "severities": severities,
+            "source_ips": source_ips,
+            "rules": rules,
         }
 
     def export_alerts(self, output_path: Path, export_format: str) -> int:

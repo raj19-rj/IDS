@@ -137,7 +137,16 @@ Dashboard filters:
 
 - Add `?severity=HIGH` to filter by severity
 - Add `?src_ip=10.0.0.5` to filter by source IP
+- Add `?rule=Port%20Scan` to filter by rule
+- Add `?search=3389` to search descriptions, rules, and IPs
 - Example: `http://127.0.0.1:5000/?severity=HIGH&src_ip=10.0.0.5`
+
+Dashboard extras:
+
+- Click a rule name to open the full alert detail view
+- Use `/api/summary` for summary JSON
+- Use `/api/alerts` for alert JSON
+- Export directly from the dashboard with CSV and JSON links
 
 ## Export Alerts
 

@@ -119,6 +119,27 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["rule_name"], "Port Scan")
 
+    def test_store_can_lookup_alert_and_distinct_values(self) -> None:
+        alert = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 0, 0),
+            severity="HIGH",
+            rule_name="Port Scan",
+            description="scan",
+            src_ip="1.2.3.4",
+            dst_ip="10.0.0.10",
+            metadata={"x": "1"},
+        )
+        self.store.save_alerts([alert])
+
+        found = self.store.get_alert(alert.fingerprint)
+        values = self.store.distinct_values()
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found["rule_name"], "Port Scan")
+        self.assertIn("HIGH", values["severities"])
+        self.assertIn("1.2.3.4", values["source_ips"])
+        self.assertIn("Port Scan", values["rules"])
+
 
 if __name__ == "__main__":
     unittest.main()
