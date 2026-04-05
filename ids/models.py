@@ -5,6 +5,20 @@ from datetime import datetime
 from hashlib import sha256
 
 
+def parse_timestamp(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+
+    return datetime.fromisoformat(normalized)
+
+
 @dataclass(slots=True)
 class Event:
     timestamp: datetime
@@ -20,7 +34,7 @@ class Event:
     @classmethod
     def from_dict(cls, payload: dict) -> "Event":
         return cls(
-            timestamp=datetime.fromisoformat(payload["timestamp"]),
+            timestamp=parse_timestamp(str(payload["timestamp"])),
             src_ip=str(payload["src_ip"]),
             dst_ip=str(payload["dst_ip"]),
             protocol=str(payload.get("protocol", "TCP")).upper(),

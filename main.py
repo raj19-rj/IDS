@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--input", type=Path, required=True, help="Path to log file")
     analyze.add_argument(
         "--format",
-        choices=["jsonl", "csv"],
+        choices=["jsonl", "csv", "suricata-eve", "zeek-conn", "windows-firewall"],
         default="jsonl",
         help="Input format",
     )
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--input", type=Path, help="Path to log file to tail")
     monitor.add_argument(
         "--format",
-        choices=["jsonl", "csv"],
+        choices=["jsonl", "csv", "suricata-eve", "zeek-conn", "windows-firewall"],
         default="jsonl",
         help="Input format for --input",
     )
@@ -149,8 +149,12 @@ def command_dashboard(config: IDSConfig, host: str, port: int, debug: bool) -> i
 
 def command_export(config: IDSConfig, output_path: Path, export_format: str) -> int:
     _, store, _, _ = create_runtime(config)
-    exported_count = store.export_alerts(output_path=output_path, export_format=export_format)
-    print(f"Exported {exported_count} alert(s) to {output_path}")
+    resolved_output_path = output_path.resolve()
+    exported_count = store.export_alerts(
+        output_path=resolved_output_path,
+        export_format=export_format,
+    )
+    print(f"Exported {exported_count} alert(s) to {resolved_output_path}")
     return 0
 
 

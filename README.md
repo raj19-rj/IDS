@@ -24,6 +24,7 @@ It now supports:
 - `ids/models.py` - event and alert data models
 - `ids/detector.py` - detection engine and rules
 - `ids/ingest.py` - JSONL and CSV loaders
+- `ids/ingest.py` - JSONL, CSV, Suricata, Zeek, and Windows firewall loaders
 - `ids/monitor.py` - continuous monitoring loop
 - `ids/responders.py` - optional automated response actions
 - `ids/storage.py` - JSONL alert persistence
@@ -50,6 +51,24 @@ python main.py analyze --input sample_data/events.jsonl
 ```
 
 This prints alerts and stores them in `data/alerts.jsonl`.
+
+Analyze a Suricata `eve.json` file:
+
+```bash
+python main.py analyze --input sample_data/suricata_eve.json --format suricata-eve
+```
+
+Analyze a Zeek `conn.log` file:
+
+```bash
+python main.py analyze --input sample_data/zeek_conn.log --format zeek-conn
+```
+
+Analyze a Windows Firewall `pfirewall.log` style file:
+
+```bash
+python main.py analyze --input sample_data/windows_firewall.log --format windows-firewall
+```
 
 ## Continuous Monitoring
 
@@ -103,6 +122,12 @@ Supported overrides:
 - `IDS_DASHBOARD_PASSWORD_SALT`
 - `IDS_SECRET_KEY`
 
+Dashboard filters:
+
+- Add `?severity=HIGH` to filter by severity
+- Add `?src_ip=10.0.0.5` to filter by source IP
+- Example: `http://127.0.0.1:5000/?severity=HIGH&src_ip=10.0.0.5`
+
 ## Export Alerts
 
 Export stored alerts to CSV:
@@ -118,6 +143,14 @@ python main.py export --format json --output exports/alerts.json
 ```
 
 ## Input Format
+
+Supported formats:
+
+- `jsonl`
+- `csv`
+- `suricata-eve`
+- `zeek-conn`
+- `windows-firewall`
 
 Each line in the JSONL file should be a JSON object like this:
 

@@ -41,8 +41,17 @@ class AlertStore:
                 saved += 1
         return saved
 
-    def list_alerts(self, limit: int = 100) -> list[dict[str, str]]:
+    def list_alerts(
+        self,
+        limit: int = 100,
+        severity: str | None = None,
+        src_ip: str | None = None,
+    ) -> list[dict[str, object]]:
         rows = self._read_all()
+        if severity:
+            rows = [row for row in rows if row["severity"] == severity]
+        if src_ip:
+            rows = [row for row in rows if row["src_ip"] == src_ip]
         rows.sort(key=lambda row: row["timestamp"], reverse=True)
         return rows[:limit]
 
@@ -65,7 +74,20 @@ class AlertStore:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if export_format == "json":
-            output_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+            output_rows = [
+                {
+                    "fingerprint": row["fingerprint"],
+                    "timestamp": row["timestamp"],
+                    "severity": row["severity"],
+                    "rule_name": row["rule_name"],
+                    "description": row["description"],
+                    "src_ip": row["src_ip"],
+                    "dst_ip": row["dst_ip"],
+                    "metadata": row["metadata"],
+                }
+                for row in rows
+            ]
+            output_path.write_text(json.dumps(output_rows, indent=2), encoding="utf-8")
             return len(rows)
 
         if export_format == "csv":
@@ -84,17 +106,33 @@ class AlertStore:
                     ],
                 )
                 writer.writeheader()
-                writer.writerows(rows)
+                writer.writerows(
+                    [
+                        {
+                            "timestamp": row["timestamp"],
+                            "severity": row["severity"],
+                            "rule_name": row["rule_name"],
+                            "description": row["description"],
+                            "src_ip": row["src_ip"],
+                            "dst_ip": row["dst_ip"],
+                            "metadata_json": json.dumps(row["metadata"], sort_keys=True),
+                            "fingerprint": row["fingerprint"],
+                        }
+                        for row in rows
+                    ]
+                )
             return len(rows)
 
         raise ValueError(f"Unsupported export format: {export_format}")
 
-    def _read_all(self) -> list[dict[str, str]]:
-        rows: list[dict[str, str]] = []
+    def _read_all(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
         with self.database_path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
+                row = json.loads(line)
+                row["metadata"] = json.loads(row.pop("metadata_json"))
+                rows.append(row)
         return rows

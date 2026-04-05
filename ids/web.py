@@ -5,7 +5,7 @@ from html import escape
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from ids.config import DEFAULT_DASHBOARD_PASSWORD_HASH, IDSConfig
 from ids.security import verify_password
@@ -46,7 +46,12 @@ def _login_page(error: str = "") -> str:
 """
 
 
-def _dashboard_page(summary: dict[str, object], alerts: list[dict[str, str]]) -> str:
+def _dashboard_page(
+    summary: dict[str, object],
+    alerts: list[dict[str, object]],
+    selected_severity: str,
+    selected_src_ip: str,
+) -> str:
     rows = "".join(
         f"""
         <tr>
@@ -106,8 +111,17 @@ def _dashboard_page(summary: dict[str, object], alerts: list[dict[str, str]]) ->
         {top_sources}
       </div>
       <div class="card">
-        <h3>Dashboard Notes</h3>
-        <p>Refresh after running analysis or monitor mode to see newly stored alerts.</p>
+        <h3>Filter Alerts</h3>
+        <form method="get" action="/">
+          <label>Severity</label>
+          <input name="severity" value="{escape(selected_severity)}" placeholder="HIGH or MEDIUM">
+          <label>Source IP</label>
+          <input name="src_ip" value="{escape(selected_src_ip)}" placeholder="10.0.0.5">
+          <div style="margin-top: 0.8rem;">
+            <button type="submit" style="padding: 0.7rem 1rem; border: 0; border-radius: 10px; background: #10233f; color: white;">Apply</button>
+            <a href="/" style="margin-left: 0.8rem;">Clear</a>
+          </div>
+        </form>
       </div>
     </div>
     <table>
@@ -143,10 +157,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server: DashboardServer
 
     def do_GET(self) -> None:
-        if self.path == "/login":
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path == "/login":
             self._send_html(_login_page())
             return
-        if self.path == "/logout":
+        if path == "/logout":
             session_id = self._session_id()
             if session_id:
                 self.server.sessions.discard(session_id)
@@ -155,12 +173,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", "ids_session=; Path=/; Max-Age=0")
             self.end_headers()
             return
-        if self.path == "/":
+        if path == "/":
             if not self._is_authenticated():
                 self._redirect("/login")
                 return
+            selected_severity = query.get("severity", [""])[0].strip().upper()
+            selected_src_ip = query.get("src_ip", [""])[0].strip()
             self._send_html(
-                _dashboard_page(self.server.store.summary(), self.server.store.list_alerts())
+                _dashboard_page(
+                    self.server.store.summary(),
+                    self.server.store.list_alerts(
+                        severity=selected_severity or None,
+                        src_ip=selected_src_ip or None,
+                    ),
+                    selected_severity=selected_severity,
+                    selected_src_ip=selected_src_ip,
+                )
             )
             return
         self.send_error(HTTPStatus.NOT_FOUND)

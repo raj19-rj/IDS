@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 data/
+exports/
 tests/.tmp_detector/
 tests/.tmp_storage/
 tests/__pycache__/

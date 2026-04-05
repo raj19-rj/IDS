@@ -1,0 +1,4 @@
+#separator \x09
+#fields	ts	id.orig_h	id.orig_p	id.resp_h	id.resp_p	proto	orig_bytes	resp_bytes
+1712311200.0	10.0.0.8	50500	10.0.0.20	445	tcp	120	40
+1712311205.0	10.0.0.8	50501	10.0.0.20	3389	tcp	140	50

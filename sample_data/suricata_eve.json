@@ -1,0 +1,2 @@
+{"timestamp":"2026-04-05T10:00:00.000000+00:00","event_type":"alert","src_ip":"10.0.0.5","dest_ip":"10.0.0.10","src_port":50000,"dest_port":3389,"proto":"TCP","flow":{"bytes_toserver":420}}
+{"timestamp":"2026-04-05T10:00:05.000000+00:00","event_type":"alert","src_ip":"10.0.0.5","dest_ip":"10.0.0.10","src_port":50001,"dest_port":445,"proto":"TCP","flow":{"bytes_toserver":320}}

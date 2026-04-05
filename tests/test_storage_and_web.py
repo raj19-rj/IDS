@@ -91,6 +91,33 @@ class StorageAndWebTests(unittest.TestCase):
         exported_rows = json.loads(export_path.read_text(encoding="utf-8"))
         self.assertEqual(len(exported_rows), 1)
         self.assertEqual(exported_rows[0]["src_ip"], "1.2.3.4")
+        self.assertEqual(exported_rows[0]["metadata"]["x"], "1")
+
+    def test_list_alerts_can_filter_by_severity_and_source(self) -> None:
+        first = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 0, 0),
+            severity="HIGH",
+            rule_name="Port Scan",
+            description="scan",
+            src_ip="1.2.3.4",
+            dst_ip="10.0.0.10",
+            metadata={"x": "1"},
+        )
+        second = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 5, 0),
+            severity="MEDIUM",
+            rule_name="Suspicious Port Access",
+            description="port",
+            src_ip="5.6.7.8",
+            dst_ip="10.0.0.20",
+            metadata={"port": "23"},
+        )
+        self.store.save_alerts([first, second])
+
+        filtered = self.store.list_alerts(severity="HIGH", src_ip="1.2.3.4")
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["rule_name"], "Port Scan")
 
 
 if __name__ == "__main__":
