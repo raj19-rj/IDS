@@ -14,6 +14,10 @@ class EventLoader:
             return self.load_jsonl(path)
         if file_format == "csv":
             return self.load_csv(path)
+        if file_format == "windows-events-json":
+            return self.load_windows_events_json(path)
+        if file_format == "sysmon-json":
+            return self.load_sysmon_json(path)
         if file_format == "suricata-eve":
             return self.load_suricata_eve(path)
         if file_format == "zeek-conn":
@@ -48,9 +52,9 @@ class EventLoader:
         return events
 
     def parse_lines(self, lines: list[str], file_format: str) -> list[Event]:
-        if file_format not in {"jsonl", "suricata-eve"}:
+        if file_format not in {"jsonl", "suricata-eve", "windows-events-json", "sysmon-json"}:
             raise ValueError(
-                "Incremental line parsing currently supports jsonl and suricata-eve only"
+                "Incremental line parsing currently supports jsonl, suricata-eve, windows-events-json, and sysmon-json only"
             )
 
         events: list[Event] = []
@@ -61,8 +65,44 @@ class EventLoader:
             payload = json.loads(line)
             if file_format == "jsonl":
                 events.append(Event.from_dict(payload))
-            else:
+            elif file_format == "suricata-eve":
                 events.extend(self._parse_suricata_record(payload))
+            elif file_format == "windows-events-json":
+                events.extend(self._parse_windows_event_record(payload))
+            else:
+                events.extend(self._parse_sysmon_record(payload))
+        return events
+
+    def load_windows_events_json(self, path: Path) -> list[Event]:
+        events: list[Event] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    events.extend(self._parse_windows_event_record(payload))
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(
+                        f"Invalid Windows event record at line {line_number}: {exc}"
+                    ) from exc
+        return events
+
+    def load_sysmon_json(self, path: Path) -> list[Event]:
+        events: list[Event] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    events.extend(self._parse_sysmon_record(payload))
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(
+                        f"Invalid Sysmon record at line {line_number}: {exc}"
+                    ) from exc
         return events
 
     def load_suricata_eve(self, path: Path) -> list[Event]:
@@ -197,3 +237,69 @@ class EventLoader:
             event_type="packet",
             outcome=str(record.get("action", "unknown")).lower(),
         )
+
+    def _parse_windows_event_record(self, payload: dict) -> list[Event]:
+        event_id = int(payload.get("EventID", 0) or 0)
+        timestamp = parse_timestamp(
+            str(
+                payload.get("TimeCreated")
+                or payload.get("Timestamp")
+                or payload.get("timestamp")
+            )
+        )
+        src_ip = str(
+            payload.get("IpAddress")
+            or payload.get("SourceNetworkAddress")
+            or payload.get("src_ip")
+            or "0.0.0.0"
+        )
+        dst_ip = str(payload.get("dst_ip") or payload.get("Computer") or "host")
+
+        # 4625 is a common failed logon event
+        if event_id == 4625:
+            return [
+                Event(
+                    timestamp=timestamp,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    protocol="AUTH",
+                    src_port=0,
+                    dst_port=0,
+                    size=0,
+                    event_type="auth",
+                    outcome="failed",
+                )
+            ]
+
+        return []
+
+    def _parse_sysmon_record(self, payload: dict) -> list[Event]:
+        event_id = int(payload.get("EventID", 0) or 0)
+        timestamp = parse_timestamp(
+            str(
+                payload.get("UtcTime")
+                or payload.get("TimeCreated")
+                or payload.get("timestamp")
+            )
+        )
+        src_ip = str(payload.get("SourceIp") or payload.get("src_ip") or "0.0.0.0")
+        dst_ip = str(payload.get("DestinationIp") or payload.get("dst_ip") or "0.0.0.0")
+        protocol = str(payload.get("Protocol", "TCP")).upper()
+
+        # Sysmon Event ID 3 is network connection
+        if event_id == 3:
+            return [
+                Event(
+                    timestamp=timestamp,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    protocol=protocol,
+                    src_port=int(payload.get("SourcePort", 0) or 0),
+                    dst_port=int(payload.get("DestinationPort", 0) or 0),
+                    size=int(payload.get("ImageLoadedBytes", 0) or 0),
+                    event_type="packet",
+                    outcome="allowed",
+                )
+            ]
+
+        return []

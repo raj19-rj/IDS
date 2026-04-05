@@ -28,7 +28,15 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--input", type=Path, required=True, help="Path to log file")
     analyze.add_argument(
         "--format",
-        choices=["jsonl", "csv", "suricata-eve", "zeek-conn", "windows-firewall"],
+        choices=[
+            "jsonl",
+            "csv",
+            "windows-events-json",
+            "sysmon-json",
+            "suricata-eve",
+            "zeek-conn",
+            "windows-firewall",
+        ],
         default="jsonl",
         help="Input format",
     )
@@ -40,7 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--input", type=Path, help="Path to log file to tail")
     monitor.add_argument(
         "--format",
-        choices=["jsonl", "csv", "suricata-eve", "zeek-conn", "windows-firewall"],
+        choices=[
+            "jsonl",
+            "csv",
+            "windows-events-json",
+            "sysmon-json",
+            "suricata-eve",
+            "zeek-conn",
+            "windows-firewall",
+        ],
         default="jsonl",
         help="Input format for --input",
     )

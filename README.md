@@ -23,8 +23,7 @@ It now supports:
 - `config/ids_config.json` - thresholds, auth settings, and response settings
 - `ids/models.py` - event and alert data models
 - `ids/detector.py` - detection engine and rules
-- `ids/ingest.py` - JSONL and CSV loaders
-- `ids/ingest.py` - JSONL, CSV, Suricata, Zeek, and Windows firewall loaders
+- `ids/ingest.py` - JSONL, CSV, Windows Event Log, Sysmon, Suricata, Zeek, and Windows firewall loaders
 - `ids/monitor.py` - continuous monitoring loop
 - `ids/responders.py` - optional automated response actions
 - `ids/storage.py` - JSONL alert persistence
@@ -68,6 +67,18 @@ Analyze a Windows Firewall `pfirewall.log` style file:
 
 ```bash
 python main.py analyze --input sample_data/windows_firewall.log --format windows-firewall
+```
+
+Analyze exported Windows Security Event Log JSON:
+
+```bash
+python main.py analyze --input sample_data/windows_events.jsonl --format windows-events-json
+```
+
+Analyze exported Sysmon JSON:
+
+```bash
+python main.py analyze --input sample_data/sysmon_events.jsonl --format sysmon-json
 ```
 
 ## Continuous Monitoring
@@ -148,9 +159,28 @@ Supported formats:
 
 - `jsonl`
 - `csv`
+- `windows-events-json`
+- `sysmon-json`
 - `suricata-eve`
 - `zeek-conn`
 - `windows-firewall`
+
+For Windows export workflows, you can prepare JSONL input with PowerShell and then analyze it with this project.
+
+Example for failed logons from the Security log:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625} |
+Select-Object TimeCreated, Id, MachineName, @{Name='IpAddress';Expression={$_.Properties[19].Value}} |
+ForEach-Object {
+  [pscustomobject]@{
+    TimeCreated = $_.TimeCreated.ToString("s")
+    EventID = $_.Id
+    Computer = $_.MachineName
+    IpAddress = $_.IpAddress
+  } | ConvertTo-Json -Compress
+} | Set-Content sample_data\windows_events.jsonl
+```
 
 Each line in the JSONL file should be a JSON object like this:
 
