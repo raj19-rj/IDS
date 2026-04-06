@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import sqlite3
+import tempfile
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
@@ -12,7 +16,6 @@ from ids.models import Alert
 
 class AlertStore:
     def __init__(self, database_path: Path) -> None:
-        self.database_path = database_path
         self._lock = RLock()
         self._runtime_state: dict[str, object] = {
             "monitor_running": False,
@@ -22,36 +25,53 @@ class AlertStore:
             "last_message": "Monitor not started.",
             "updated_at": None,
         }
+
+        self._legacy_jsonl_path: Path | None = None
+        resolved_path = database_path
+        if database_path.suffix.lower() == ".jsonl":
+            self._legacy_jsonl_path = database_path
+            resolved_path = database_path.with_suffix(".sqlite")
+
+        self.database_path = self._resolve_sqlite_path(resolved_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.database_path.exists():
-            self.database_path.write_text("", encoding="utf-8")
+
+        with self._connection() as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            self._ensure_schema(connection)
+
+        if self._legacy_jsonl_path is not None:
+            self._migrate_legacy_jsonl(self._legacy_jsonl_path)
 
     def save_alerts(self, alerts: list[Alert]) -> int:
-        with self._lock:
-            existing = {record["fingerprint"] for record in self._read_all_unlocked()}
-            saved = 0
-            with self.database_path.open("a", encoding="utf-8") as handle:
-                for alert in alerts:
-                    if alert.fingerprint in existing:
-                        continue
-                    handle.write(
-                        json.dumps(
-                            {
-                                "fingerprint": alert.fingerprint,
-                                "timestamp": alert.timestamp.isoformat(),
-                                "severity": alert.severity,
-                                "rule_name": alert.rule_name,
-                                "description": alert.description,
-                                "src_ip": alert.src_ip,
-                                "dst_ip": alert.dst_ip,
-                                "metadata_json": json.dumps(alert.metadata, sort_keys=True),
-                            }
-                        )
-                        + "\n"
-                    )
-                    existing.add(alert.fingerprint)
-                    saved += 1
-            return saved
+        if not alerts:
+            return 0
+
+        rows = [
+            (
+                alert.fingerprint,
+                alert.timestamp.isoformat(),
+                alert.severity,
+                alert.rule_name,
+                alert.description,
+                alert.src_ip,
+                alert.dst_ip,
+                json.dumps(alert.metadata, sort_keys=True),
+            )
+            for alert in alerts
+        ]
+
+        with self._lock, self._connection() as connection:
+            cursor = connection.executemany(
+                """
+                INSERT OR IGNORE INTO alerts (
+                    fingerprint, timestamp, severity, rule_name,
+                    description, src_ip, dst_ip, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            connection.commit()
+            return cursor.rowcount if cursor.rowcount is not None else 0
 
     def list_alerts(
         self,
@@ -64,23 +84,34 @@ class AlertStore:
         sort_by: str = "timestamp",
         sort_dir: str = "desc",
     ) -> list[dict[str, object]]:
-        rows = self._filter_rows(
-            self._read_all(),
+        sort_column_map = {
+            "timestamp": "timestamp",
+            "severity": "severity",
+            "rule_name": "rule_name",
+            "src_ip": "src_ip",
+            "dst_ip": "dst_ip",
+        }
+        safe_sort_column = sort_column_map.get(sort_by, "timestamp")
+        safe_sort_dir = "ASC" if sort_dir.lower() == "asc" else "DESC"
+
+        where_clause, params = self._build_where_clause(
             severity=severity,
             src_ip=src_ip,
             rule_name=rule_name,
             search=search,
         )
-        reverse = sort_dir.lower() != "asc"
-        sort_key_map = {
-            "timestamp": lambda row: self._parse_timestamp(str(row["timestamp"])),
-            "severity": lambda row: str(row["severity"]),
-            "rule_name": lambda row: str(row["rule_name"]).lower(),
-            "src_ip": lambda row: str(row["src_ip"]).lower(),
-            "dst_ip": lambda row: str(row["dst_ip"]).lower(),
-        }
-        rows.sort(key=sort_key_map.get(sort_by, sort_key_map["timestamp"]), reverse=reverse)
-        return rows[offset : offset + limit]
+
+        query = f"""
+            SELECT fingerprint, timestamp, severity, rule_name, description, src_ip, dst_ip, metadata_json
+            FROM alerts
+            {where_clause}
+            ORDER BY {safe_sort_column} {safe_sort_dir}, fingerprint {safe_sort_dir}
+            LIMIT ? OFFSET ?
+        """
+
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(query, (*params, int(limit), int(offset)))
+            return [self._row_to_dict(row) for row in cursor.fetchall()]
 
     def summary(self) -> dict[str, object]:
         rows = self._read_all()
@@ -102,10 +133,17 @@ class AlertStore:
         }
 
     def get_alert(self, fingerprint: str) -> dict[str, object] | None:
-        for row in self._read_all():
-            if row["fingerprint"] == fingerprint:
-                return row
-        return None
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT fingerprint, timestamp, severity, rule_name, description, src_ip, dst_ip, metadata_json
+                FROM alerts
+                WHERE fingerprint = ?
+                """,
+                (fingerprint,),
+            )
+            row = cursor.fetchone()
+            return self._row_to_dict(row) if row else None
 
     def count_alerts(
         self,
@@ -114,20 +152,38 @@ class AlertStore:
         rule_name: str | None = None,
         search: str | None = None,
     ) -> int:
-        rows = self._filter_rows(
-            self._read_all(),
+        where_clause, params = self._build_where_clause(
             severity=severity,
             src_ip=src_ip,
             rule_name=rule_name,
             search=search,
         )
-        return len(rows)
+        query = f"SELECT COUNT(*) FROM alerts {where_clause}"
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(query, params)
+            count_row = cursor.fetchone()
+            return int(count_row[0]) if count_row else 0
 
     def distinct_values(self) -> dict[str, list[str]]:
-        rows = self._read_all()
-        severities = sorted({str(row["severity"]) for row in rows})
-        source_ips = sorted({str(row["src_ip"]) for row in rows})
-        rules = sorted({str(row["rule_name"]) for row in rows})
+        with self._lock, self._connection() as connection:
+            severities = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT severity FROM alerts ORDER BY severity ASC"
+                ).fetchall()
+            ]
+            source_ips = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT src_ip FROM alerts ORDER BY src_ip ASC"
+                ).fetchall()
+            ]
+            rules = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT rule_name FROM alerts ORDER BY rule_name ASC"
+                ).fetchall()
+            ]
         return {
             "severities": severities,
             "source_ips": source_ips,
@@ -304,54 +360,188 @@ class AlertStore:
 
         raise ValueError(f"Unsupported export format: {export_format}")
 
-    def _read_all(self) -> list[dict[str, object]]:
-        with self._lock:
-            return self._read_all_unlocked()
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        return connection
 
-    def _read_all_unlocked(self) -> list[dict[str, object]]:
-        rows: list[dict[str, object]] = []
-        with self.database_path.open("r", encoding="utf-8") as handle:
+    @contextmanager
+    def _connection(self) -> sqlite3.Connection:
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    def _resolve_sqlite_path(self, desired_path: Path) -> Path:
+        desired_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._can_open_sqlite(desired_path):
+            return desired_path
+
+        fallback_root = Path(tempfile.gettempdir()) / "ids-sqlite"
+        fallback_root.mkdir(parents=True, exist_ok=True)
+        fingerprint = hashlib.sha256(str(desired_path).encode("utf-8")).hexdigest()[:12]
+        fallback_path = fallback_root / f"{desired_path.stem}-{fingerprint}.sqlite"
+        return fallback_path
+
+    def _can_open_sqlite(self, path: Path) -> bool:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE IF NOT EXISTS __ids_probe (x INTEGER)")
+            connection.execute("INSERT INTO __ids_probe (x) VALUES (1)")
+            connection.execute("DELETE FROM __ids_probe")
+            connection.execute("DROP TABLE __ids_probe")
+            connection.commit()
+            return True
+        except sqlite3.Error:
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _ensure_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerts (
+                fingerprint TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                rule_name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                src_ip TEXT NOT NULL,
+                dst_ip TEXT NOT NULL,
+                metadata_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_src_ip ON alerts(src_ip)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_rule_name ON alerts(rule_name)")
+
+    def _migrate_legacy_jsonl(self, legacy_path: Path) -> None:
+        if not legacy_path.exists():
+            return
+
+        with self._lock, self._connection() as connection:
+            current_count = connection.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+            if int(current_count) > 0:
+                return
+
+        legacy_rows: list[tuple[str, str, str, str, str, str, str, str]] = []
+        with legacy_path.open("r", encoding="utf-8") as handle:
             for line in handle:
-                line = line.strip()
-                if not line:
+                raw = line.strip()
+                if not raw:
                     continue
                 try:
-                    row = json.loads(line)
-                    row["metadata"] = json.loads(row.pop("metadata_json"))
+                    row = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                rows.append(row)
-        return rows
+
+                metadata_json = row.get("metadata_json", "{}")
+                if isinstance(metadata_json, dict):
+                    metadata_json = json.dumps(metadata_json, sort_keys=True)
+
+                legacy_rows.append(
+                    (
+                        str(row.get("fingerprint", "")),
+                        str(row.get("timestamp", "")),
+                        str(row.get("severity", "LOW")),
+                        str(row.get("rule_name", "Unknown Rule")),
+                        str(row.get("description", "")),
+                        str(row.get("src_ip", "0.0.0.0")),
+                        str(row.get("dst_ip", "0.0.0.0")),
+                        str(metadata_json),
+                    )
+                )
+
+        if not legacy_rows:
+            return
+
+        with self._lock, self._connection() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO alerts (
+                    fingerprint, timestamp, severity, rule_name,
+                    description, src_ip, dst_ip, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                legacy_rows,
+            )
+            connection.commit()
+
+    def _build_where_clause(
+        self,
+        *,
+        severity: str | None,
+        src_ip: str | None,
+        rule_name: str | None,
+        search: str | None,
+    ) -> tuple[str, tuple[object, ...]]:
+        clauses: list[str] = []
+        params: list[object] = []
+
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if src_ip:
+            clauses.append("src_ip = ?")
+            params.append(src_ip)
+        if rule_name:
+            clauses.append("rule_name = ?")
+            params.append(rule_name)
+        if search:
+            like_query = f"%{search.lower()}%"
+            clauses.append(
+                "(" \
+                "LOWER(description) LIKE ? OR " \
+                "LOWER(src_ip) LIKE ? OR " \
+                "LOWER(dst_ip) LIKE ? OR " \
+                "LOWER(rule_name) LIKE ? OR " \
+                "LOWER(metadata_json) LIKE ?" \
+                ")"
+            )
+            params.extend([like_query, like_query, like_query, like_query, like_query])
+
+        if not clauses:
+            return "", tuple(params)
+        return f"WHERE {' AND '.join(clauses)}", tuple(params)
+
+    def _read_all(self) -> list[dict[str, object]]:
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT fingerprint, timestamp, severity, rule_name, description, src_ip, dst_ip, metadata_json
+                FROM alerts
+                ORDER BY timestamp DESC, fingerprint DESC
+                """
+            )
+            return [self._row_to_dict(row) for row in cursor.fetchall()]
+
+    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, object]:
+        metadata_text = str(row["metadata_json"])
+        try:
+            metadata = json.loads(metadata_text)
+            if not isinstance(metadata, dict):
+                metadata = {"value": metadata}
+        except json.JSONDecodeError:
+            metadata = {}
+
+        return {
+            "fingerprint": str(row["fingerprint"]),
+            "timestamp": str(row["timestamp"]),
+            "severity": str(row["severity"]),
+            "rule_name": str(row["rule_name"]),
+            "description": str(row["description"]),
+            "src_ip": str(row["src_ip"]),
+            "dst_ip": str(row["dst_ip"]),
+            "metadata": metadata,
+        }
 
     def _parse_timestamp(self, value: str) -> datetime:
         parsed = datetime.fromisoformat(value)
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
-
-    def _filter_rows(
-        self,
-        rows: list[dict[str, object]],
-        severity: str | None,
-        src_ip: str | None,
-        rule_name: str | None,
-        search: str | None,
-    ) -> list[dict[str, object]]:
-        if severity:
-            rows = [row for row in rows if row["severity"] == severity]
-        if src_ip:
-            rows = [row for row in rows if row["src_ip"] == src_ip]
-        if rule_name:
-            rows = [row for row in rows if row["rule_name"] == rule_name]
-        if search:
-            query = search.lower()
-            rows = [
-                row
-                for row in rows
-                if query in row["description"].lower()
-                or query in row["src_ip"].lower()
-                or query in row["dst_ip"].lower()
-                or query in row["rule_name"].lower()
-                or any(query in str(value).lower() for value in row["metadata"].values())
-            ]
-        return rows

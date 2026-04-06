@@ -7,7 +7,7 @@ It now supports:
 - Offline analysis from JSONL and CSV event files
 - Continuous monitoring mode for tailed log files
 - Optional live packet capture with `scapy`
-- Persistent alert storage with JSONL
+- Persistent alert storage with SQLite
 - Authenticated web dashboard
 - Configurable thresholds and allowlists
 - Optional automated IP blocking response
@@ -26,7 +26,7 @@ It now supports:
 - `ids/ingest.py` - JSONL, CSV, Windows Event Log, Sysmon, Suricata, Zeek, and Windows firewall loaders
 - `ids/monitor.py` - continuous monitoring loop
 - `ids/responders.py` - optional automated response actions
-- `ids/storage.py` - JSONL alert persistence
+- `ids/storage.py` - SQLite alert persistence
 - `ids/web.py` - built-in dashboard server
 - `ids/sniffer.py` - optional live capture support
 - `tests/` - basic unit tests
@@ -49,7 +49,7 @@ pip install -r requirements.txt
 python main.py analyze --input sample_data/events.jsonl
 ```
 
-This prints alerts and stores them in `data/alerts.jsonl`.
+This prints alerts and stores them in `data/alerts.sqlite`.
 
 Analyze a Suricata `eve.json` file:
 

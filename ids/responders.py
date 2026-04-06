@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import platform
 import subprocess
 from dataclasses import dataclass
@@ -39,20 +40,29 @@ class ResponderPipeline:
         return self.results
 
     def _block_ip(self, src_ip: str) -> ResponseResult:
+        normalized_ip = self._normalize_ip(src_ip)
+        if normalized_ip is None:
+            return ResponseResult(
+                action="block_ip",
+                src_ip=src_ip,
+                status="invalid_ip",
+                detail="Source IP is not a valid IPv4/IPv6 address",
+            )
+
         mode = self.config.response.block_command_mode
         if mode == "simulate":
             return ResponseResult(
                 action="block_ip",
-                src_ip=src_ip,
+                src_ip=normalized_ip,
                 status="simulated",
-                detail=self._build_block_command(src_ip),
+                detail=self._build_block_command(normalized_ip),
             )
 
-        command = self._build_command_parts(src_ip)
+        command = self._build_command_parts(normalized_ip)
         if not command:
             return ResponseResult(
                 action="block_ip",
-                src_ip=src_ip,
+                src_ip=normalized_ip,
                 status="unsupported",
                 detail="No firewall command available for this operating system",
             )
@@ -62,17 +72,23 @@ class ResponderPipeline:
         except Exception as exc:  # noqa: BLE001
             return ResponseResult(
                 action="block_ip",
-                src_ip=src_ip,
+                src_ip=normalized_ip,
                 status="failed",
                 detail=str(exc),
             )
 
         return ResponseResult(
             action="block_ip",
-            src_ip=src_ip,
+            src_ip=normalized_ip,
             status="executed",
             detail="Firewall rule added",
         )
+
+    def _normalize_ip(self, src_ip: str) -> str | None:
+        try:
+            return str(ipaddress.ip_address(src_ip))
+        except ValueError:
+            return None
 
     def _build_block_command(self, src_ip: str) -> str:
         command = self._build_command_parts(src_ip)

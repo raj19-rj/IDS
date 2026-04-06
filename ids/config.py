@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
         "allowlisted_ips": ["127.0.0.1", "::1"],
     },
     "storage": {
-        "database_path": "data/alerts.jsonl",
+        "database_path": "data/alerts.sqlite",
     },
     "monitoring": {
         "poll_interval_seconds": 5,

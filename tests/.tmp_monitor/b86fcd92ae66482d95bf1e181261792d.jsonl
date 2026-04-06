@@ -1,0 +1,2 @@
+{"timestamp":"2026-04-01T12:00:00","src_ip":"10.0.0.1","dst_ip":"10.0.0.2","protocol":"TCP","src_port":5000,"dst_port":23,"size":120,"event_type":"packet","outcome":"unknown"}
+{"timestamp":"2026-04-01T12:00:01","src_ip":"10.0.0.1","dst_ip":"10.0.0.3","protocol":"TCP","src_port":5001,"dst_port":23,"size":160,"event_type":"packet","outcome":"unknown"}
