@@ -1,38 +1,71 @@
 from __future__ import annotations
 
-import secrets
+import csv
+import io
 import json
+import secrets
+import time
 from html import escape
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from ids.config import DEFAULT_DASHBOARD_PASSWORD_HASH, IDSConfig
 from ids.security import verify_password
 from ids.storage import AlertStore
 
+SESSION_TTL_SECONDS = 30 * 60
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 5 * 60
 
-def _login_page(error: str = "") -> str:
-    error_html = f'<p class="error">{escape(error)}</p>' if error else ""
+
+def _build_query(params: dict[str, str | int | None], *, omit_page: bool = False) -> str:
+    filtered = {}
+    for key, value in params.items():
+        if value in ("", None):
+            continue
+        if omit_page and key == "page":
+            continue
+        filtered[key] = str(value)
+    return urlencode(filtered)
+
+
+def _json_script_payload(payload: object) -> str:
+    return json.dumps(payload).replace("</", "<\\/")
+
+
+def _login_page(error: str = "", warning: str = "") -> str:
+    error_html = f'<p class="notice error">{escape(error)}</p>' if error else ""
+    warning_html = f'<p class="notice warn">{escape(warning)}</p>' if warning else ""
     return f"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>IDS Login</title>
   <style>
-    body {{ font-family: Georgia, serif; background: linear-gradient(135deg, #f7f3e8, #d9e7ff); color: #10233f; padding: 3rem; }}
-    .card {{ max-width: 420px; margin: 6rem auto; background: rgba(255,255,255,0.9); padding: 2rem; border-radius: 18px; box-shadow: 0 20px 50px rgba(16,35,63,0.15); }}
-    input {{ width: 100%; padding: 0.75rem; margin: 0.5rem 0 1rem; border-radius: 10px; border: 1px solid #9db4d3; box-sizing: border-box; }}
-    button {{ width: 100%; padding: 0.85rem; border: 0; border-radius: 10px; background: #10233f; color: white; font-weight: bold; }}
-    .error {{ color: #9d1b1b; }}
+    :root {{ --ink:#10233f; --muted:#5b6f8f; --card:rgba(255,255,255,0.95); --bg1:#f6efe2; --bg2:#dce9ff; --danger:#8a1f1f; --warn:#8a5a00; }}
+    body {{ font-family: Georgia, serif; background:
+      radial-gradient(circle at top left, rgba(182,77,43,0.18), transparent 28%),
+      linear-gradient(135deg, var(--bg1), var(--bg2)); color: var(--ink); padding: 2rem; min-height:100vh; box-sizing:border-box; }}
+    .card {{ max-width: 460px; margin: 8vh auto; background: var(--card); padding: 2rem; border-radius: 22px; box-shadow: 0 24px 60px rgba(16,35,63,0.16); }}
+    h1 {{ margin-top:0; }}
+    p.lead {{ color: var(--muted); }}
+    label {{ display:block; margin-top: 0.9rem; font-weight: bold; }}
+    input {{ width: 100%; padding: 0.8rem; margin-top: 0.35rem; border-radius: 12px; border: 1px solid #9db4d3; box-sizing: border-box; }}
+    button {{ width: 100%; padding: 0.9rem; border: 0; border-radius: 12px; background: #10233f; color: white; font-weight: bold; margin-top: 1rem; }}
+    .notice {{ border-radius: 12px; padding: 0.8rem 1rem; }}
+    .error {{ background: rgba(138,31,31,0.08); color: var(--danger); }}
+    .warn {{ background: rgba(138,90,0,0.08); color: var(--warn); }}
   </style>
 </head>
 <body>
   <div class="card">
     <h1>IDS Dashboard</h1>
-    <p>Sign in to review alerts and top sources.</p>
+    <p class="lead">Sign in to review alerts, investigate details, and export findings.</p>
+    {warning_html}
     {error_html}
     <form method="post" action="/login">
       <label>Username</label>
@@ -48,163 +81,129 @@ def _login_page(error: str = "") -> str:
 
 
 def _dashboard_page(
-    summary: dict[str, object],
-    alerts: list[dict[str, object]],
-    selected_severity: str,
-    selected_src_ip: str,
-    selected_rule: str,
-    selected_search: str,
-    selected_limit: str,
-    filter_options: dict[str, list[str]],
+    payload: dict[str, object],
 ) -> str:
-    rows = "".join(
-        f"""
-        <tr>
-          <td>{escape(alert['timestamp'])}</td>
-          <td><span class="badge badge-{escape(str(alert['severity']).lower())}">{escape(alert['severity'])}</span></td>
-          <td><a href="/alert?id={escape(alert['fingerprint'])}">{escape(alert['rule_name'])}</a></td>
-          <td>{escape(alert['src_ip'])}</td>
-          <td>{escape(alert['dst_ip'])}</td>
-          <td>{escape(alert['description'])}</td>
-        </tr>
-        """
-        for alert in alerts
-    ) or '<tr><td colspan="6">No alerts stored yet.</td></tr>'
-
-    top_sources = "".join(
-        f'<p><span class="pill">{escape(source["src_ip"])}</span> {source["count"]} alert(s)</p>'
-        for source in summary["top_sources"]
-    ) or "<p>No sources yet.</p>"
-
-    top_rules = "".join(
-        f'<p><span class="pill">{escape(rule["rule_name"])}</span> {rule["count"]} hit(s)</p>'
-        for rule in summary["top_rules"]
-    ) or "<p>No rules fired yet.</p>"
-
-    severity_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == selected_severity else ""}>{escape(value)}</option>'
-        for value in filter_options["severities"]
-    )
-    source_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == selected_src_ip else ""}>{escape(value)}</option>'
-        for value in filter_options["source_ips"]
-    )
-    rule_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == selected_rule else ""}>{escape(value)}</option>'
-        for value in filter_options["rules"]
-    )
-
-    severity_counts = summary["severity_counts"]
-    return f"""
+    template = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>IDS Dashboard</title>
-  <meta http-equiv="refresh" content="30">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sentinel Ops Dashboard</title>
   <style>
-    :root {{ --ink:#10233f; --card:rgba(255,255,255,0.92); --bg1:#f6efe2; --bg2:#dce9ff; --high:#8a1f1f; --medium:#9c5a00; }}
-    body {{ font-family: Georgia, serif; margin: 0; background:
-      radial-gradient(circle at top left, rgba(182,77,43,0.15), transparent 30%),
-      linear-gradient(135deg, var(--bg1), var(--bg2)); color: var(--ink); }}
-    .wrap {{ max-width: 1100px; margin: 0 auto; padding: 2rem; }}
-    .hero {{ display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 1.5rem; }}
-    .card {{ background: var(--card); border-radius: 18px; padding: 1.2rem; box-shadow: 0 18px 40px rgba(16,35,63,0.12); }}
-    table {{ width: 100%; border-collapse: collapse; background: var(--card); border-radius: 18px; overflow: hidden; box-shadow: 0 18px 40px rgba(16,35,63,0.12); }}
-    th, td {{ padding: 0.9rem; text-align: left; border-bottom: 1px solid rgba(16,35,63,0.08); vertical-align: top; }}
-    th {{ background: rgba(16,35,63,0.08); }}
-    .pill {{ display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px; background: rgba(182,77,43,0.15); }}
-    .bar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }}
-    .bar-links {{ display:flex; gap:1rem; align-items:center; }}
-    .badge {{ display:inline-block; padding:0.2rem 0.55rem; border-radius:999px; font-size:0.9rem; font-weight:bold; }}
-    .badge-high {{ background:rgba(138,31,31,0.12); color:var(--high); }}
-    .badge-medium {{ background:rgba(156,90,0,0.12); color:var(--medium); }}
-    a {{ color: var(--ink); }}
-    form.filters {{ display:grid; gap:0.75rem; }}
-    input, select {{ width:100%; padding:0.7rem; border-radius:10px; border:1px solid #9db4d3; box-sizing:border-box; background:white; }}
-    .actions {{ display:flex; gap:0.75rem; flex-wrap:wrap; margin-top:0.9rem; }}
-    .button {{ display:inline-block; padding:0.7rem 1rem; border-radius:10px; background:#10233f; color:white; text-decoration:none; border:0; }}
+    :root{--bg:#f3f8ff;--panel:#fff;--soft:#f6f9ff;--line:#d7e3f0;--text:#12253f;--muted:#5f7390;--blue:#2563eb;--blue2:#1e40af;--high:#c43e31;--med:#bc7b1c;--ok:#108a63;--r:16px;--sh:0 18px 36px rgba(15,35,55,.09)}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 110% -20%,rgba(37,99,235,.16),transparent 30%),var(--bg);color:var(--text);font:15px/1.45 "Segoe UI",Tahoma,sans-serif}
+    .app{display:grid;grid-template-columns:250px minmax(0,1fr);min-height:100vh}.side{background:linear-gradient(180deg,#10233c,#182f4d);color:#eef4ff;padding:1rem;display:flex;flex-direction:column;gap:.8rem}
+    .brand{display:flex;gap:.7rem;align-items:center;padding-bottom:.8rem;border-bottom:1px solid rgba(255,255,255,.12)}.mark{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#60a5fa,var(--blue));display:grid;place-items:center;font-weight:800}
+    .label{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:rgba(224,231,255,.62)}.n{display:flex;gap:.55rem;align-items:center;padding:.66rem .75rem;border-radius:12px;color:#f7fbff;text-decoration:none;transition:.22s}.n:hover{background:rgba(255,255,255,.1);box-shadow:0 8px 18px rgba(37,99,235,.15)}.n.active{background:linear-gradient(135deg,rgba(96,165,250,.3),rgba(37,99,235,.36));box-shadow:inset 0 0 0 1px rgba(191,219,254,.32),0 10px 20px rgba(37,99,235,.22)}
+    .ic{display:inline-flex;width:16px;height:16px;align-items:center;justify-content:center;color:inherit;flex:0 0 16px;transition:transform .2s,color .2s,filter .2s}.ic svg{width:16px;height:16px;fill:currentColor}
+    .n:hover .ic{transform:translateY(-1px);color:#bfdbfe;filter:drop-shadow(0 2px 6px rgba(191,219,254,.35))}
+    .n.active .ic{color:#dbeafe;filter:drop-shadow(0 2px 8px rgba(147,197,253,.45))}
+    .note{margin-top:auto;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1);padding:.8rem;border-radius:12px;font-size:.83rem;color:rgba(240,249,255,.85)}
+    main{padding:1rem;display:grid;gap:1rem}.top,.card{background:var(--panel);border:1px solid var(--line);box-shadow:var(--sh)}.top{display:flex;justify-content:space-between;gap:.7rem;align-items:center;border-radius:18px;padding:.72rem .9rem}
+    .search{flex:1;max-width:620px}.search input{width:100%;padding:.72rem .8rem;border:1px solid var(--line);border-radius:12px}
+    .acts{display:flex;gap:.5rem;align-items:center}.btn{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:12px;padding:.6rem .85rem;font-weight:600;text-decoration:none;cursor:pointer;transition:.22s}
+    .btn.i{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;padding:0}
+    .btn.i:hover{border-color:#bfd4f6;background:#f1f6ff;box-shadow:0 10px 20px rgba(37,99,235,.16)}
+    .btn.i:hover .ic{transform:translateY(-1px) scale(1.03);color:#1e40af;filter:drop-shadow(0 2px 6px rgba(37,99,235,.25))}
+    .btn.i:active{transform:translateY(0)}
+    .btn:hover,.chip:hover{transform:translateY(-1px);box-shadow:0 9px 16px rgba(37,99,235,.12)}.btn.p{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;border:0}.btn.g{background:var(--soft);color:var(--blue2)}
+    .avatar{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,#dbeafe,#bfdbfe);display:grid;place-items:center;color:var(--blue2);font-weight:700}
+    .muted{color:var(--muted)}.small{font-size:.85rem}.head{display:flex;justify-content:space-between;align-items:flex-end;gap:.7rem;flex-wrap:wrap}.head h2{margin:0}
+    .banner{display:none;border-radius:12px;padding:.68rem .8rem}.err{background:#fff2f2;color:#991b1b;border:1px solid #fecaca}.load{background:#eff6ff;color:#1e3a8a;border:1px dashed #bfdbfe}
+    .kpi{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem}.card{border-radius:var(--r);padding:.9rem}.num{font-size:1.9rem;font-weight:800;margin:.22rem 0}.meta{font-size:.83rem;color:var(--ok)}
+    .status{display:grid;grid-template-columns:1.2fr .8fr;gap:1rem}.pill{display:inline-flex;gap:.4rem;align-items:center;padding:.4rem .7rem;border-radius:999px;background:rgba(16,138,99,.13);color:var(--ok);font-weight:700}.pill.off{background:rgba(196,62,49,.12);color:var(--high)}.dot{width:.68rem;height:.68rem;border-radius:50%;background:currentColor}
+    .barline{height:10px;background:#e6edf9;border-radius:999px;overflow:hidden}.barline span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--blue),#0ea5e9,var(--ok))}
+    .grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.95fr);gap:1rem}.g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+    .row{display:flex;justify-content:space-between;gap:.6rem;align-items:center;flex-wrap:wrap}.chips{display:flex;gap:.4rem;flex-wrap:wrap}.chip{border:1px solid var(--line);background:var(--soft);padding:.4rem .68rem;border-radius:999px;cursor:pointer;font-weight:700;color:var(--muted)}.chip.a{background:#e6efff;color:var(--blue2)}
+    .timeline{display:flex;gap:.45rem;align-items:flex-end;min-height:170px;margin-top:.6rem}.bw{flex:1;text-align:center}.b{min-height:8px;border-radius:11px 11px 4px 4px;background:linear-gradient(180deg,var(--blue),#60a5fa)}.ll{font-size:.73rem;color:var(--muted);margin-top:.25rem}
+    .line{width:100%;height:190px;margin-top:.6rem;display:block}.area{fill:rgba(37,99,235,.16)}.path{fill:none;stroke:#1d4ed8;stroke-width:2.5}
+    .list{display:grid;gap:.55rem;margin-top:.55rem}.it{display:flex;justify-content:space-between;gap:.55rem;padding:.68rem .72rem;border:1px solid var(--line);border-radius:12px;background:var(--soft)}
+    .badge{display:inline-block;border-radius:999px;padding:.17rem .48rem;font-size:.78rem;font-weight:700}.bh{color:var(--high);background:rgba(196,62,49,.12)}.bm{color:var(--med);background:rgba(188,123,28,.14)}.bl{color:var(--blue2);background:rgba(37,99,235,.1)}
+    .tags{display:flex;gap:.32rem;flex-wrap:wrap;margin-top:.22rem}.tag{font-size:.75rem;padding:.14rem .45rem;border-radius:999px;background:#eaf2ff;color:var(--blue2)}
+    form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem}.full{grid-column:1/-1}label{display:block;font-size:.84rem;font-weight:700;margin-bottom:.25rem}
+    input,select{width:100%;padding:.66rem .72rem;border:1px solid var(--line);border-radius:11px}.actions{display:flex;gap:.5rem;flex-wrap:wrap}
+    table{width:100%;border-collapse:collapse;margin-top:.6rem;border:1px solid var(--line);border-radius:12px;overflow:hidden}th,td{padding:.7rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{font-size:.76rem;text-transform:uppercase;letter-spacing:.05em;color:#4c6180;background:#f3f8ff}
+    .pagi{display:flex;justify-content:space-between;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.6rem}.empty{border:1px dashed var(--line);padding:.72rem;border-radius:11px;background:var(--soft);color:var(--muted)}
+    .pie{width:150px;height:150px;border-radius:50%;margin:auto;position:relative;background:conic-gradient(var(--blue) 0deg,var(--blue) 240deg,#87b4ff 240deg,#87b4ff 315deg,#e5edf8 315deg,#e5edf8 360deg)}.pie:after{content:"";position:absolute;inset:22px;background:#fff;border-radius:50%}.pie strong{position:absolute;inset:0;display:grid;place-items:center;z-index:1}
+    @media (max-width:1200px){.grid,.status,.g2,.kpi{grid-template-columns:1fr}.head,.top,.row{flex-direction:column;align-items:flex-start}}@media (max-width:900px){.app{grid-template-columns:1fr}.side{position:relative;height:auto}}@media (max-width:760px){form{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="bar">
-      <h1>Intrusion Detection Dashboard</h1>
-      <div class="bar-links">
-        <a href="/api/summary">Summary API</a>
-        <a href="/api/alerts">Alerts API</a>
-        <a href="/logout">Logout</a>
-      </div>
-    </div>
-    <div class="hero">
-      <div class="card"><h3>Total Alerts</h3><p>{summary["total_alerts"]}</p></div>
-      <div class="card"><h3>High Severity</h3><p>{severity_counts.get("HIGH", 0)}</p></div>
-      <div class="card"><h3>Medium Severity</h3><p>{severity_counts.get("MEDIUM", 0)}</p></div>
-    </div>
-    <div class="hero">
-      <div class="card">
-        <h3>Top Sources</h3>
-        {top_sources}
-      </div>
-      <div class="card">
-        <h3>Top Rules</h3>
-        {top_rules}
-      </div>
-      <div class="card">
-        <h3>Filter Alerts</h3>
-        <form method="get" action="/" class="filters">
-          <label>Severity</label>
-          <select name="severity">
-            <option value="">All severities</option>
-            {severity_options}
-          </select>
-          <label>Source IP</label>
-          <select name="src_ip">
-            <option value="">All sources</option>
-            {source_options}
-          </select>
-          <label>Rule</label>
-          <select name="rule">
-            <option value="">All rules</option>
-            {rule_options}
-          </select>
-          <label>Search</label>
-          <input name="search" value="{escape(selected_search)}" placeholder="description, source, destination">
-          <label>Limit</label>
-          <select name="limit">
-            <option value="25"{" selected" if selected_limit == "25" else ""}>25</option>
-            <option value="50"{" selected" if selected_limit == "50" else ""}>50</option>
-            <option value="100"{" selected" if selected_limit == "100" else ""}>100</option>
-            <option value="250"{" selected" if selected_limit == "250" else ""}>250</option>
-          </select>
-          <div class="actions">
-            <button type="submit" class="button">Apply</button>
-            <a href="/" >Clear</a>
-            <a href="/export?format=csv">Export CSV</a>
-            <a href="/export?format=json">Export JSON</a>
-          </div>
-        </form>
-      </div>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Severity</th>
-          <th>Rule</th>
-          <th>Source</th>
-          <th>Destination</th>
-          <th>Description</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows}
-      </tbody>
-    </table>
+  <div class="app">
+    <aside class="side">
+      <div class="brand"><div class="mark">SO</div><div><strong>Sentinel Ops</strong><div class="small" style="color:rgba(224,231,255,.75)">Security analytics</div></div></div>
+      <div class="label">Workspace</div>
+      <a class="n active" href="/" title="Overview"><span class="ic"><svg viewBox="0 0 24 24"><path d="M3 13h8v8H3zm10-10h8v18h-8zM3 3h8v8H3z"/></svg></span>Dashboard</a>
+      <a class="n" href="/api/dashboard" title="API payload"><span class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v4H4zm0 6h6v10H4zm8 0h8v10h-8z"/></svg></span>Data API</a>
+      <a class="n" href="/api/alerts" title="Alert feed"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 2 1 21h22zm1 14h-2v2h2zm0-6h-2v4h2z"/></svg></span>Alerts</a>
+      <a class="n" href="/api/live" title="Live data"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 20a8 8 0 1 1 8-8h2A10 10 0 1 0 12 22zm1-11h-2v5l4.3 2.6 1-1.7-3.3-1.9z"/></svg></span>Live</a>
+      <a class="n" href="/api/health" title="Health endpoint"><span class="ic"><svg viewBox="0 0 24 24"><path d="M3 13h4l2-4 4 8 2-4h6v-2h-5l-3 6-4-8-2 4H3z"/></svg></span>Health</a>
+      <div class="label">Actions</div>
+      <a class="n" href="/export?format=csv" title="Download CSV"><span class="ic"><svg viewBox="0 0 24 24"><path d="M5 20h14v2H5zm7-18 5 5h-3v6h-4V7H7z"/></svg></span>Export CSV</a>
+      <a class="n" href="/export?format=json" title="Download JSON"><span class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4zm4 4H6v8h2zm4 0h-2v8h2zm6 0h-2v8h2z"/></svg></span>Export JSON</a>
+      <a class="n" href="/logout" title="Sign out"><span class="ic"><svg viewBox="0 0 24 24"><path d="M10 17v-2h4V9h-4V7h6v10z"/><path d="M5 3h8v2H7v14h6v2H5z"/><path d="m18 12-3 3v-2h-4v-2h4V9z"/></svg></span>Logout</a>
+      <div class="note">Production-style dashboard layout with KPI cards, chart analytics, and live incident operations.</div>
+    </aside>
+    <main>
+      <div class="top"><div class="search"><input id="global-search" type="search" placeholder="Search alerts, rule names, IPs, descriptions, metadata"></div><div class="acts"><button class="btn i" id="refresh-btn" title="Refresh dashboard"><span class="ic"><svg viewBox="0 0 24 24"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.76-4.24L13 11h7V4z"/></svg></span></button><a class="btn i" href="/api/health" title="Health API"><span class="ic"><svg viewBox="0 0 24 24"><path d="M3 13h4l2-4 4 8 2-4h6v-2h-5l-3 6-4-8-2 4H3z"/></svg></span></a><button class="btn i" title="Notifications"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22m7-6V11a7 7 0 1 0-14 0v5l-2 2v1h18v-1z"/></svg></span></button><div style="display:flex;gap:.45rem;align-items:center"><div class="avatar">AD</div><div><strong>Admin</strong><div class="small muted">SOC Team</div></div></div></div></div>
+      <div class="head"><div><h2>Enterprise Threat Dashboard</h2><div class="muted">Modern clean UI with responsive layout, filters, sorting, and dynamic visual analytics.</div></div><div class="acts"><a class="btn g" id="export-csv" href="/export?format=csv">Export CSV</a><a class="btn g" id="export-json" href="/export?format=json">Export JSON</a><a class="btn p" href="/api/dashboard">Open API</a></div></div>
+      <div id="error" class="banner err"></div><div id="loading" class="banner load">Loading data...</div>
+      <section class="kpi"><div class="card"><div class="small muted">Total Alerts</div><div class="num" id="m-total">0</div><div class="meta">Stored inventory</div></div><div class="card"><div class="small muted">High Severity</div><div class="num" id="m-high">0</div><div class="meta">Critical queue</div></div><div class="card"><div class="small muted">Recent Alerts</div><div class="num" id="m-recent">0</div><div class="meta">Current window</div></div><div class="card"><div class="small muted">Alerts / Minute</div><div class="num" id="m-rate">0</div><div class="meta">Live pressure</div></div></section>
+      <section class="status"><div class="card"><div class="row"><div><h3 style="margin:0">Operations Status</h3><div class="muted" id="live-text">Checking feed...</div></div><div class="pill" id="live-pill"><span class="dot"></span><span id="live-pill-text">Checking</span></div></div></div><div class="card"><div class="row"><h3 style="margin:0">Risk Score</h3><strong id="threat-score">0/100</strong></div><div class="barline"><span id="threat-bar"></span></div><div class="small muted" title="Calculated from recent high and medium incidents">Threat pressure for selected date window</div><div class="small muted" id="threat-meta">Waiting for events.</div></div></section>
+      <section class="grid">
+        <div>
+          <div class="card"><div class="row"><div><h3 style="margin:0">Alert Trends</h3><div class="small muted">Bar, line, and pie data updates with filters.</div></div><div class="chips"><button class="chip a" data-window="15">15m</button><button class="chip" data-window="60">1h</button><button class="chip" data-window="240">4h</button><button class="chip" data-window="1440">24h</button></div></div><div class="timeline" id="timeline"></div><svg class="line" id="line" viewBox="0 0 640 220" preserveAspectRatio="none"></svg><div class="small muted" id="timeline-sum">No timeline data.</div></div>
+          <div class="g2" style="margin-top:1rem"><div class="card"><h3 style="margin:0">Active Source Tracker</h3><div class="small muted">Top talkers in selected window.</div><div id="tracker" class="list"></div></div><div class="card"><h3 style="margin:0">Live Incident Stream</h3><div class="small muted">Recent detections for analysts.</div><div id="feed" class="list"></div></div></div>
+          <div class="card" style="margin-top:1rem"><div class="row"><div><h3 style="margin:0">Alert Table</h3><div class="small muted" id="table-sum">Loading...</div></div><div class="small muted">Search, sort, filter, paginate</div></div><table><thead><tr><th>Time</th><th>Severity</th><th>Rule</th><th>Source</th><th>Destination</th><th>Description</th></tr></thead><tbody id="table"></tbody></table><div id="pagi" class="pagi"></div></div>
+        </div>
+        <div style="display:grid;gap:1rem">
+          <div class="card"><h3 style="margin:0">Filters & Sorting</h3><form id="filters"><div><label for="severity">Severity</label><select id="severity"></select></div><div><label for="src_ip">Source IP</label><select id="src_ip"></select></div><div><label for="rule">Category / Rule</label><select id="rule"></select></div><div><label for="window">Date Window</label><select id="window"><option value="15">Last 15 minutes</option><option value="60">Last 1 hour</option><option value="240">Last 4 hours</option><option value="1440">Last 24 hours</option></select></div><div><label for="sort_by">Sort By</label><select id="sort_by"><option value="timestamp">Timestamp</option><option value="severity">Severity</option><option value="rule_name">Rule</option><option value="src_ip">Source IP</option><option value="dst_ip">Destination IP</option></select></div><div><label for="sort_dir">Sort Direction</label><select id="sort_dir"><option value="desc">Descending</option><option value="asc">Ascending</option></select></div><div><label for="limit">Rows Per Page</label><select id="limit"><option value="25">25</option><option value="50">50</option><option value="100">100</option><option value="250">250</option></select></div><div class="full"><label for="search">Search</label><input id="search" type="search" placeholder="Search alerts, rule names, and metadata"></div><div class="full actions"><button class="btn p" type="submit">Apply Filters</button><a class="btn g" href="/">Reset</a></div></form></div>
+          <div class="card"><div style="display:grid;grid-template-columns:150px 1fr;gap:.8rem;align-items:center"><div class="pie" id="pie"><strong id="pie-total">0</strong></div><div><h3 style="margin:0">Severity Distribution</h3><div id="sev-list" class="list"></div></div></div></div>
+          <div class="card"><h3 style="margin:0">Top Sources</h3><div id="top-sources" class="list"></div></div>
+          <div class="card"><h3 style="margin:0">Top Rules</h3><div id="top-rules" class="list"></div></div>
+          <div class="card"><h3 style="margin:0">Recent Rule Heat</h3><div id="recent-rules" class="list"></div></div>
+        </div>
+      </section>
+    </main>
   </div>
+  <script id="initial-data" type="application/json">__INITIAL_DATA__</script>
+  <script>
+    let state=JSON.parse(document.getElementById("initial-data").textContent),debounce=null;
+    const el={error:document.getElementById("error"),loading:document.getElementById("loading"),filters:document.getElementById("filters"),severity:document.getElementById("severity"),src_ip:document.getElementById("src_ip"),rule:document.getElementById("rule"),window:document.getElementById("window"),sort_by:document.getElementById("sort_by"),sort_dir:document.getElementById("sort_dir"),limit:document.getElementById("limit"),search:document.getElementById("search"),globalSearch:document.getElementById("global-search"),chips:Array.from(document.querySelectorAll(".chip"))};
+    const esc=v=>String(v??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"),n=v=>Number(v||0).toLocaleString();
+    const sev=s=>{const x=String(s||"").toUpperCase();if(x==="HIGH")return"badge bh";if(x==="MEDIUM")return"badge bm";return"badge bl"};
+    const setOpts=(node,arr,val,label)=>{node.innerHTML=[`<option value="">${label}</option>`,...(arr||[]).map(x=>`<option value="${esc(x)}">${esc(x)}</option>`)].join("");node.value=val||""};
+    const getF=()=>({severity:el.severity.value||"",src_ip:el.src_ip.value||"",rule:el.rule.value||"",window:el.window.value||"15",sort_by:el.sort_by.value||"timestamp",sort_dir:el.sort_dir.value||"desc",limit:el.limit.value||"50",search:el.search.value||"",page:String((state.filters&&state.filters.page)||1)});
+    function syncFilters(){const o=state.filter_options||{},f=state.filters||{};setOpts(el.severity,o.severities,f.severity,"All severities");setOpts(el.src_ip,o.source_ips,f.src_ip,"All source IPs");setOpts(el.rule,o.rules,f.rule,"All rules");["window","sort_by","sort_dir","limit","search"].forEach(k=>{if(f[k]!==undefined&&el[k])el[k].value=String(f[k])});el.globalSearch.value=f.search||"";el.chips.forEach(c=>c.classList.toggle("a",c.dataset.window===String(el.window.value||"15")))}
+    const showErr=m=>{el.error.textContent=m;el.error.style.display="block"},clearErr=()=>{el.error.style.display="none";el.error.textContent=""},setLoading=v=>{el.loading.style.display=v?"block":"none"};
+    function render(){
+      const s=state.summary||{},l=state.live||{},sc=s.severity_counts||{},rt=state.runtime||{};
+      document.getElementById("m-total").textContent=n(s.total_alerts||0);document.getElementById("m-high").textContent=n(sc.HIGH||0);document.getElementById("m-recent").textContent=n(l.recent_alert_count||0);document.getElementById("m-rate").textContent=Number(l.alerts_per_minute||0).toFixed(2);
+      const live=Boolean(l.is_live);document.getElementById("live-text").textContent=live?`Live feed active. Last alert at ${l.last_alert_at||"recently"}.`:"No fresh events in last minute.";document.getElementById("live-pill-text").textContent=live?"Live":"Idle";document.getElementById("live-pill").classList.toggle("off",!live);
+      const score=Number(l.threat_score||0);document.getElementById("threat-score").textContent=`${score}/100`;document.getElementById("threat-bar").style.width=`${Math.max(0,Math.min(100,score))}%`;document.getElementById("threat-meta").textContent=`Mode: ${rt.mode||"idle"}, cycle: ${rt.last_cycle||0}`;
+      const tl=l.timeline||[],tEl=document.getElementById("timeline"),line=document.getElementById("line"),sum=document.getElementById("timeline-sum");
+      if(!tl.length){tEl.innerHTML='<div class="empty">No timeline points in selected window.</div>';line.innerHTML="";sum.textContent="No trend data available.";}else{const mx=Math.max(1,...tl.map(p=>Number(p.count||0)));tEl.innerHTML=tl.map(p=>{const h=Math.max(8,Math.round((Number(p.count||0)/mx)*130));return`<div class="bw"><div class="b" style="height:${h}px" title="${esc(p.label)}: ${esc(p.count)} alerts"></div><div class="ll">${esc(p.label)}</div></div>`}).join("");const w=640,h=220,p=16,st=tl.length>1?(w-p*2)/(tl.length-1):0,pts=tl.map((x,i)=>{const v=Number(x.count||0),xx=p+st*i,yy=h-p-((h-p*2)*v)/mx;return{xx,yy}}),path=pts.map((z,i)=>`${i?"L":"M"} ${z.xx} ${z.yy}`).join(" "),area=`${path} L ${w-p} ${h-p} L ${p} ${h-p} Z`;line.innerHTML=`<path class="area" d="${area}"></path><path class="path" d="${path}"></path>`;sum.textContent=`${tl.reduce((a,x)=>a+Number(x.count||0),0)} alerts in selected window.`}
+      const hi=Number(sc.HIGH||0),md=Number(sc.MEDIUM||0),lo=Number((sc.LOW||0)+(sc.INFO||0)),tot=Math.max(1,hi+md+lo),hD=Math.round((hi/tot)*360),mD=Math.round((md/tot)*360),pie=document.getElementById("pie");pie.style.background=`conic-gradient(var(--blue) 0deg,var(--blue) ${hD}deg,#87b4ff ${hD}deg,#87b4ff ${hD+mD}deg,#e5edf8 ${hD+mD}deg,#e5edf8 360deg)`;document.getElementById("pie-total").textContent=n(hi+md+lo);
+      document.getElementById("sev-list").innerHTML=[`<div class="it"><span>High severity</span><strong>${n(hi)}</strong></div>`,`<div class="it"><span>Medium severity</span><strong>${n(md)}</strong></div>`,`<div class="it"><span>Low / Info</span><strong>${n(lo)}</strong></div>`].join("");
+      const track=l.source_tracker||[];document.getElementById("tracker").innerHTML=track.length?track.map(r=>`<div class="it"><div><strong>${esc(r.src_ip)}</strong><div class="small muted">Last seen: ${esc(r.last_seen||"n/a")}</div><div class="tags">${(r.destinations||[]).map(d=>`<span class="tag">${esc(d)}</span>`).join("")||'<span class="tag">No destinations</span>'}</div></div><div><strong>${n(r.count||0)}</strong><div class="small muted">${n(r.high_count||0)} high</div></div></div>`).join(""):'<div class="empty">No active sources.</div>';
+      const feed=l.feed||[];document.getElementById("feed").innerHTML=feed.length?feed.map(a=>`<div class="it"><div><div><span class="${sev(a.severity)}">${esc(a.severity)}</span> <strong>${esc(a.rule_name)}</strong></div><div class="small muted">${esc(a.src_ip)} -> ${esc(a.dst_ip)}</div><div class="small muted">${esc(a.timestamp)}</div></div></div>`).join(""):'<div class="empty">No incidents in this window.</div>';
+      const simple=(id,arr,key,count,msg)=>{document.getElementById(id).innerHTML=arr&&arr.length?arr.map(x=>`<div class="it"><span>${esc(x[key])}</span><strong>${n(x[count])}</strong></div>`).join(""):`<div class="empty">${esc(msg)}</div>`};simple("top-sources",s.top_sources||[],"src_ip","count","No source data.");simple("top-rules",s.top_rules||[],"rule_name","count","No rule data.");simple("recent-rules",l.top_recent_rules||[],"rule_name","count","No recent rule activity.");
+      const rows=state.alerts||[],tb=document.getElementById("table"),totF=Number(state.total_filtered||0),pg=Number((state.filters&&state.filters.page)||1),lim=Number((state.filters&&state.filters.limit)||50),pages=Math.max(1,Number(state.total_pages||1));tb.innerHTML=rows.length?rows.map(a=>`<tr><td>${esc(a.timestamp)}</td><td><span class="${sev(a.severity)}">${esc(a.severity)}</span></td><td><a href="/alert?id=${encodeURIComponent(a.fingerprint||"")}">${esc(a.rule_name)}</a></td><td>${esc(a.src_ip)}</td><td>${esc(a.dst_ip)}</td><td>${esc(a.description)}</td></tr>`).join(""):'<tr><td colspan="6"><div class="empty">No matching alerts found.</div></td></tr>';
+      const st=totF?((pg-1)*lim+1):0,en=Math.min(pg*lim,totF);document.getElementById("table-sum").textContent=`Showing ${st}-${en} of ${n(totF)} alerts`;document.getElementById("pagi").innerHTML=`<div class="small muted">Page ${pg} of ${pages}</div><div style="display:flex;gap:.5rem"><button class="btn g" id="pr" ${pg<=1?"disabled":""}>Previous</button><button class="btn g" id="nx" ${pg>=pages?"disabled":""}>Next</button></div>`;const pr=document.getElementById("pr"),nx=document.getElementById("nx");if(pr)pr.addEventListener("click",()=>fetchData({page:Math.max(1,pg-1)}));if(nx)nx.addEventListener("click",()=>fetchData({page:Math.min(pages,pg+1)}));
+      const q=new URLSearchParams(state.filters||{}).toString();document.getElementById("export-csv").href=`/export?format=csv&${q}`;document.getElementById("export-json").href=`/export?format=json&${q}`;
+    }
+    async function fetchData(override={},opts={}){const silent=Boolean(opts.silent),keepPage=Boolean(opts.keepPage);if(!silent)setLoading(true);clearErr();const f=getF();if(!keepPage&&!Object.prototype.hasOwnProperty.call(override,"page"))f.page="1";const q=new URLSearchParams({...f,...override});try{const r=await fetch(`/api/dashboard?${q.toString()}`,{headers:{"Accept":"application/json"}});if(!r.ok)throw new Error(`Request failed (${r.status})`);state=await r.json();syncFilters();render()}catch(e){showErr(`Unable to refresh dashboard data. ${e.message}`)}finally{if(!silent)setLoading(false)}}
+    syncFilters();render();
+    el.filters.addEventListener("submit",e=>{e.preventDefault();fetchData()});el.search.addEventListener("input",()=>{el.globalSearch.value=el.search.value});el.globalSearch.addEventListener("input",()=>{el.search.value=el.globalSearch.value;clearTimeout(debounce);debounce=setTimeout(()=>fetchData(),320)});
+    ["severity","src_ip","rule","window","sort_by","sort_dir","limit"].forEach(k=>el[k].addEventListener("change",()=>fetchData()));document.getElementById("refresh-btn").addEventListener("click",()=>fetchData({}, {keepPage:true}));
+    el.chips.forEach(c=>c.addEventListener("click",()=>{el.window.value=c.dataset.window||"15";el.chips.forEach(x=>x.classList.remove("a"));c.classList.add("a");fetchData()}));
+    setInterval(()=>fetchData({}, {silent:true,keepPage:true}),15000);
+  </script>
 </body>
 </html>
 """
+    return template.replace("__INITIAL_DATA__", _json_script_payload(payload))
 
 
 def _alert_detail_page(alert: dict[str, object]) -> str:
@@ -218,10 +217,11 @@ def _alert_detail_page(alert: dict[str, object]) -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Alert Detail</title>
   <style>
-    body {{ font-family: Georgia, serif; margin: 0; padding: 2rem; background: linear-gradient(135deg, #f6efe2, #dce9ff); color: #10233f; }}
-    .card {{ max-width: 860px; margin: 0 auto; background: rgba(255,255,255,0.95); padding: 1.5rem; border-radius: 18px; box-shadow: 0 18px 40px rgba(16,35,63,0.12); }}
+    body {{ font-family: Georgia, serif; margin: 0; padding: 1.5rem; background: linear-gradient(135deg, #f6efe2, #dce9ff); color: #10233f; }}
+    .card {{ max-width: 960px; margin: 0 auto; background: rgba(255,255,255,0.95); padding: 1.5rem; border-radius: 20px; box-shadow: 0 18px 40px rgba(16,35,63,0.12); }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 0.8rem; text-align: left; border-bottom: 1px solid rgba(16,35,63,0.08); vertical-align: top; }}
     th {{ width: 220px; }}
@@ -255,7 +255,8 @@ class DashboardServer(ThreadingHTTPServer):
         super().__init__(server_address, DashboardHandler)
         self.config = config
         self.store = store
-        self.sessions: set[str] = set()
+        self.sessions: dict[str, float] = {}
+        self.login_attempts: dict[str, list[float]] = {}
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -267,49 +268,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if path == "/login":
-            self._send_html(_login_page())
+            self._send_html(_login_page(warning=self._demo_warning()))
             return
         if path == "/logout":
             session_id = self._session_id()
             if session_id:
-                self.server.sessions.discard(session_id)
+                self.server.sessions.pop(session_id, None)
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/login")
-            self.send_header("Set-Cookie", "ids_session=; Path=/; Max-Age=0")
+            self.send_header("Set-Cookie", "ids_session=; Path=/; Max-Age=0; HttpOnly")
             self.end_headers()
             return
         if path == "/":
             if not self._is_authenticated():
                 self._redirect("/login")
                 return
-            selected_severity = query.get("severity", [""])[0].strip().upper()
-            selected_src_ip = query.get("src_ip", [""])[0].strip()
-            selected_rule = query.get("rule", [""])[0].strip()
-            selected_search = query.get("search", [""])[0].strip()
-            selected_limit = query.get("limit", ["100"])[0].strip() or "100"
-            try:
-                limit = max(1, min(int(selected_limit), 250))
-            except ValueError:
-                limit = 100
-                selected_limit = "100"
-            self._send_html(
-                _dashboard_page(
-                    self.server.store.summary(),
-                    self.server.store.list_alerts(
-                        limit=limit,
-                        severity=selected_severity or None,
-                        src_ip=selected_src_ip or None,
-                        rule_name=selected_rule or None,
-                        search=selected_search or None,
-                    ),
-                    selected_severity=selected_severity,
-                    selected_src_ip=selected_src_ip,
-                    selected_rule=selected_rule,
-                    selected_search=selected_search,
-                    selected_limit=str(limit),
-                    filter_options=self.server.store.distinct_values(),
-                )
-            )
+            self._send_html(_dashboard_page(self._build_dashboard_payload(query)))
             return
         if path == "/alert":
             if not self._is_authenticated():
@@ -322,6 +296,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             self._send_html(_alert_detail_page(alert))
             return
+        if path == "/api/health":
+            live = self.server.store.live_snapshot()
+            self._send_json(
+                {
+                    "status": "ok",
+                    "timestamp": int(time.time()),
+                    "alerts": self.server.store.summary()["total_alerts"],
+                    "live": bool(live["is_live"]),
+                    "recent_alerts": live["recent_alert_count"],
+                    "runtime": self.server.store.runtime_state(),
+                }
+            )
+            return
+        if path == "/api/dashboard":
+            if not self._is_authenticated():
+                self._redirect("/login")
+                return
+            self._send_json(self._build_dashboard_payload(query))
+            return
+        if path == "/api/live":
+            if not self._is_authenticated():
+                self._redirect("/login")
+                return
+            self._send_json(self.server.store.live_snapshot())
+            return
         if path == "/api/summary":
             if not self._is_authenticated():
                 self._redirect("/login")
@@ -332,61 +331,66 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._is_authenticated():
                 self._redirect("/login")
                 return
-            limit_text = query.get("limit", ["100"])[0].strip() or "100"
-            try:
-                limit = max(1, min(int(limit_text), 250))
-            except ValueError:
-                limit = 100
+            filters = self._extract_filters(query)
             alerts = self.server.store.list_alerts(
-                limit=limit,
-                severity=query.get("severity", [""])[0].strip().upper() or None,
-                src_ip=query.get("src_ip", [""])[0].strip() or None,
-                rule_name=query.get("rule", [""])[0].strip() or None,
-                search=query.get("search", [""])[0].strip() or None,
+                limit=filters["limit"],
+                offset=(filters["page"] - 1) * filters["limit"],
+                severity=filters["severity"] or None,
+                src_ip=filters["src_ip"] or None,
+                rule_name=filters["rule"] or None,
+                search=filters["search"] or None,
             )
-            self._send_json({"alerts": alerts, "count": len(alerts)})
+            total_filtered = self.server.store.count_alerts(
+                severity=filters["severity"] or None,
+                src_ip=filters["src_ip"] or None,
+                rule_name=filters["rule"] or None,
+                search=filters["search"] or None,
+            )
+            self._send_json(
+                {
+                    "alerts": alerts,
+                    "count": len(alerts),
+                    "total_filtered": total_filtered,
+                    "page": filters["page"],
+                    "limit": filters["limit"],
+                }
+            )
             return
         if path == "/export":
             if not self._is_authenticated():
                 self._redirect("/login")
                 return
+            filters = self._extract_filters(query)
+            rows = self.server.store.list_alerts(
+                limit=250,
+                offset=0,
+                severity=filters["severity"] or None,
+                src_ip=filters["src_ip"] or None,
+                rule_name=filters["rule"] or None,
+                search=filters["search"] or None,
+            )
             export_format = query.get("format", ["csv"])[0].strip().lower()
             if export_format == "json":
-                payload = self.server.store.list_alerts(limit=250)
-                data = json.dumps(payload, indent=2).encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Disposition", 'attachment; filename="alerts.json"')
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                self._send_download_json(rows, "alerts.json")
                 return
-            rows = self.server.store.list_alerts(limit=250)
-            csv_lines = ["timestamp,severity,rule_name,description,src_ip,dst_ip,fingerprint"]
-            for row in rows:
-                values = [
-                    str(row["timestamp"]),
-                    str(row["severity"]),
-                    str(row["rule_name"]),
-                    str(row["description"]).replace(",", ";"),
-                    str(row["src_ip"]),
-                    str(row["dst_ip"]),
-                    str(row["fingerprint"]),
-                ]
-                csv_lines.append(",".join(values))
-            data = "\n".join(csv_lines).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/csv; charset=utf-8")
-            self.send_header("Content-Disposition", 'attachment; filename="alerts.csv"')
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_download_csv(rows, "alerts.csv")
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
         if self.path != "/login":
             self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        client_ip = self.client_address[0]
+        if self._too_many_attempts(client_ip):
+            self._send_html(
+                _login_page(
+                    error="Too many login attempts. Please wait a few minutes before retrying.",
+                    warning=self._demo_warning(),
+                ),
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
             return
 
         length = int(self.headers.get("Content-Length", "0"))
@@ -401,14 +405,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             password_hash=self.server.config.dashboard.password_hash,
         ):
             session_id = secrets.token_hex(16)
-            self.server.sessions.add(session_id)
+            self.server.sessions[session_id] = time.time() + SESSION_TTL_SECONDS
+            self.server.login_attempts.pop(client_ip, None)
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/")
             self.send_header("Set-Cookie", f"ids_session={session_id}; Path=/; HttpOnly")
             self.end_headers()
             return
 
-        self._send_html(_login_page("Invalid username or password."), status=HTTPStatus.UNAUTHORIZED)
+        self._record_failed_attempt(client_ip)
+        self._send_html(
+            _login_page(
+                error="Invalid username or password.",
+                warning=self._demo_warning(),
+            ),
+            status=HTTPStatus.UNAUTHORIZED,
+        )
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -425,6 +437,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
         encoded = json.dumps(payload, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_download_json(self, payload: object, filename: str) -> None:
+        encoded = json.dumps(payload, indent=2).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_download_csv(self, rows: list[dict[str, object]], filename: str) -> None:
+        buffer = io.StringIO()
+        writer = csv.DictWriter(
+            buffer,
+            fieldnames=[
+                "timestamp",
+                "severity",
+                "rule_name",
+                "description",
+                "src_ip",
+                "dst_ip",
+                "fingerprint",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "timestamp": row["timestamp"],
+                    "severity": row["severity"],
+                    "rule_name": row["rule_name"],
+                    "description": row["description"],
+                    "src_ip": row["src_ip"],
+                    "dst_ip": row["dst_ip"],
+                    "fingerprint": row["fingerprint"],
+                }
+            )
+        encoded = buffer.getvalue().encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -445,7 +502,109 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _is_authenticated(self) -> bool:
         session_id = self._session_id()
-        return bool(session_id and session_id in self.server.sessions)
+        if not session_id:
+            return False
+        expiry = self.server.sessions.get(session_id)
+        now = time.time()
+        if expiry is None or expiry < now:
+            self.server.sessions.pop(session_id, None)
+            return False
+        self.server.sessions[session_id] = now + SESSION_TTL_SECONDS
+        return True
+
+    def _extract_filters(self, query: dict[str, list[str]]) -> dict[str, str | int]:
+        limit_text = query.get("limit", ["50"])[0].strip() or "50"
+        page_text = query.get("page", ["1"])[0].strip() or "1"
+        window_text = query.get("window", ["15"])[0].strip() or "15"
+        try:
+            limit = max(1, min(int(limit_text), 250))
+        except ValueError:
+            limit = 50
+        try:
+            page = max(1, int(page_text))
+        except ValueError:
+            page = 1
+        try:
+            window = max(5, min(int(window_text), 1440))
+        except ValueError:
+            window = 15
+        sort_by = query.get("sort_by", ["timestamp"])[0].strip() or "timestamp"
+        sort_dir = query.get("sort_dir", ["desc"])[0].strip().lower() or "desc"
+        if sort_by not in {"timestamp", "severity", "rule_name", "src_ip", "dst_ip"}:
+            sort_by = "timestamp"
+        if sort_dir not in {"asc", "desc"}:
+            sort_dir = "desc"
+        return {
+            "severity": query.get("severity", [""])[0].strip().upper(),
+            "src_ip": query.get("src_ip", [""])[0].strip(),
+            "rule": query.get("rule", [""])[0].strip(),
+            "search": query.get("search", [""])[0].strip(),
+            "limit": limit,
+            "page": page,
+            "window": window,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
+        }
+
+    def _build_dashboard_payload(self, query: dict[str, list[str]]) -> dict[str, object]:
+        filters = self._extract_filters(query)
+        total_filtered = self.server.store.count_alerts(
+            severity=filters["severity"] or None,
+            src_ip=filters["src_ip"] or None,
+            rule_name=filters["rule"] or None,
+            search=filters["search"] or None,
+        )
+        total_pages = max(1, (total_filtered + filters["limit"] - 1) // filters["limit"])
+        current_page = min(filters["page"], total_pages)
+        filters["page"] = current_page
+        offset = (current_page - 1) * filters["limit"]
+        return {
+            "summary": self.server.store.summary(),
+            "live": self.server.store.live_snapshot(window_minutes=int(filters["window"])),
+            "runtime": self.server.store.runtime_state(),
+            "alerts": self.server.store.list_alerts(
+                limit=filters["limit"],
+                offset=offset,
+                severity=filters["severity"] or None,
+                src_ip=filters["src_ip"] or None,
+                rule_name=filters["rule"] or None,
+                search=filters["search"] or None,
+                sort_by=str(filters["sort_by"]),
+                sort_dir=str(filters["sort_dir"]),
+            ),
+            "filter_options": self.server.store.distinct_values(),
+            "filters": filters,
+            "total_filtered": total_filtered,
+            "total_pages": total_pages,
+        }
+
+    def _demo_warning(self) -> str:
+        if self.server.config.dashboard.password_hash == DEFAULT_DASHBOARD_PASSWORD_HASH:
+            return (
+                "Dashboard is using the demo password. "
+                "Set IDS_DASHBOARD_PASSWORD or IDS_DASHBOARD_PASSWORD_HASH before deployment."
+            )
+        return ""
+
+    def _too_many_attempts(self, client_ip: str) -> bool:
+        now = time.time()
+        attempts = [
+            timestamp
+            for timestamp in self.server.login_attempts.get(client_ip, [])
+            if now - timestamp <= LOGIN_WINDOW_SECONDS
+        ]
+        self.server.login_attempts[client_ip] = attempts
+        return len(attempts) >= MAX_LOGIN_ATTEMPTS
+
+    def _record_failed_attempt(self, client_ip: str) -> None:
+        now = time.time()
+        attempts = [
+            timestamp
+            for timestamp in self.server.login_attempts.get(client_ip, [])
+            if now - timestamp <= LOGIN_WINDOW_SECONDS
+        ]
+        attempts.append(now)
+        self.server.login_attempts[client_ip] = attempts
 
 
 def create_server(config: IDSConfig, store: AlertStore, host: str, port: int) -> DashboardServer:
