@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import threading
 from pathlib import Path
 
 from ids.config import IDSConfig, load_config
@@ -74,11 +75,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional number of monitor cycles before exiting",
     )
+    monitor.add_argument(
+        "--replay",
+        action="store_true",
+        help="Replay the full input file every cycle for demos",
+    )
 
     dashboard = subparsers.add_parser("dashboard", help="Run the web dashboard")
     dashboard.add_argument("--host", default="127.0.0.1", help="Dashboard host")
     dashboard.add_argument("--port", type=int, default=5000, help="Dashboard port")
     dashboard.add_argument("--debug", action="store_true", help="Enable debug mode")
+    dashboard.add_argument("--input", type=Path, help="Optional log file to monitor live")
+    dashboard.add_argument(
+        "--format",
+        choices=[
+            "jsonl",
+            "csv",
+            "windows-events-json",
+            "sysmon-json",
+            "suricata-eve",
+            "zeek-conn",
+            "windows-firewall",
+        ],
+        default="jsonl",
+        help="Input format for --input",
+    )
+    dashboard.add_argument("--live", action="store_true", help="Capture live traffic")
+    dashboard.add_argument("--interface", default=None, help="Network interface")
+    dashboard.add_argument(
+        "--packet-count",
+        type=int,
+        default=100,
+        help="Packets per live capture cycle",
+    )
+    dashboard.add_argument(
+        "--replay",
+        action="store_true",
+        help="Replay the full input file every cycle for demos",
+    )
 
     export = subparsers.add_parser("export", help="Export stored alerts")
     export.add_argument(
@@ -135,6 +169,7 @@ def command_monitor(
     interface: str | None,
     packet_count: int,
     cycles: int | None,
+    replay: bool,
 ) -> int:
     detector, store, loader, responders = create_runtime(config)
     monitor = IDSMonitor(
@@ -151,14 +186,49 @@ def command_monitor(
         interface=interface,
         packet_count=packet_count,
         cycles=cycles,
+        replay=replay,
     )
     return 0
 
 
-def command_dashboard(config: IDSConfig, host: str, port: int, debug: bool) -> int:
+def command_dashboard(
+    config: IDSConfig,
+    host: str,
+    port: int,
+    debug: bool,
+    input_path: Path | None,
+    input_format: str,
+    live: bool,
+    interface: str | None,
+    packet_count: int,
+    replay: bool,
+) -> int:
     from ids.web import run_dashboard
 
-    _, store, _, _ = create_runtime(config)
+    detector, store, loader, responders = create_runtime(config)
+    if input_path or live:
+        monitor = IDSMonitor(
+            config=config,
+            detector=detector,
+            store=store,
+            loader=loader,
+            responders=responders,
+        )
+        thread = threading.Thread(
+            target=monitor.run,
+            kwargs={
+                "input_path": input_path,
+                "input_format": input_format,
+                "live": live,
+                "interface": interface,
+                "packet_count": packet_count,
+                "cycles": None,
+                "replay": replay,
+            },
+            daemon=True,
+        )
+        thread.start()
+        print("Background monitor started for the dashboard.")
     run_dashboard(config=config, store=store, host=host, port=port, debug=debug)
     return 0
 
@@ -193,10 +263,22 @@ def main() -> int:
             interface=args.interface,
             packet_count=args.packet_count,
             cycles=args.cycles,
+            replay=args.replay,
         )
 
     if args.command == "dashboard":
-        return command_dashboard(config, args.host, args.port, args.debug)
+        return command_dashboard(
+            config,
+            args.host,
+            args.port,
+            args.debug,
+            args.input,
+            args.format,
+            args.live,
+            args.interface,
+            args.packet_count,
+            args.replay,
+        )
 
     if args.command == "export":
         return command_export(config, args.output, args.format)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 import json
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ids.config import (
@@ -119,6 +119,27 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["rule_name"], "Port Scan")
 
+    def test_list_alerts_supports_offset_and_count(self) -> None:
+        alerts = [
+            Alert(
+                timestamp=datetime(2026, 4, 1, 12, index, 0),
+                severity="HIGH" if index % 2 == 0 else "MEDIUM",
+                rule_name="Port Scan",
+                description=f"scan {index}",
+                src_ip=f"1.2.3.{index}",
+                dst_ip="10.0.0.10",
+                metadata={"x": str(index)},
+            )
+            for index in range(4)
+        ]
+        self.store.save_alerts(alerts)
+
+        paged = self.store.list_alerts(limit=2, offset=1)
+        count = self.store.count_alerts(rule_name="Port Scan")
+
+        self.assertEqual(len(paged), 2)
+        self.assertEqual(count, 4)
+
     def test_store_can_lookup_alert_and_distinct_values(self) -> None:
         alert = Alert(
             timestamp=datetime(2026, 4, 1, 12, 0, 0),
@@ -139,6 +160,106 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertIn("HIGH", values["severities"])
         self.assertIn("1.2.3.4", values["source_ips"])
         self.assertIn("Port Scan", values["rules"])
+
+    def test_live_snapshot_reports_recent_activity(self) -> None:
+        now = datetime.now()
+        alerts = [
+            Alert(
+                timestamp=now - timedelta(minutes=2),
+                severity="HIGH",
+                rule_name="Port Scan",
+                description="scan",
+                src_ip="1.2.3.4",
+                dst_ip="10.0.0.10",
+                metadata={"x": "1"},
+            ),
+            Alert(
+                timestamp=now - timedelta(seconds=30),
+                severity="MEDIUM",
+                rule_name="Traffic Burst",
+                description="burst",
+                src_ip="1.2.3.4",
+                dst_ip="10.0.0.20",
+                metadata={"bytes": "2000"},
+            ),
+        ]
+        self.store.save_alerts(alerts)
+
+        snapshot = self.store.live_snapshot(window_minutes=15)
+
+        self.assertTrue(snapshot["is_live"])
+        self.assertEqual(snapshot["recent_alert_count"], 2)
+        self.assertEqual(snapshot["high_recent_count"], 1)
+        self.assertEqual(snapshot["medium_recent_count"], 1)
+        self.assertEqual(snapshot["source_tracker"][0]["src_ip"], "1.2.3.4")
+        self.assertGreaterEqual(len(snapshot["timeline"]), 1)
+
+    def test_live_snapshot_handles_mixed_timezone_timestamps(self) -> None:
+        aware_alert = Alert(
+            timestamp=datetime.now(timezone.utc) - timedelta(seconds=20),
+            severity="HIGH",
+            rule_name="Port Scan",
+            description="scan",
+            src_ip="9.9.9.9",
+            dst_ip="10.0.0.10",
+            metadata={"x": "1"},
+        )
+        naive_alert = Alert(
+            timestamp=datetime.now() - timedelta(seconds=10),
+            severity="MEDIUM",
+            rule_name="Traffic Burst",
+            description="burst",
+            src_ip="8.8.8.8",
+            dst_ip="10.0.0.20",
+            metadata={"bytes": "2000"},
+        )
+        self.store.save_alerts([aware_alert, naive_alert])
+
+        snapshot = self.store.live_snapshot(window_minutes=15)
+
+        self.assertEqual(snapshot["recent_alert_count"], 2)
+        self.assertIsNotNone(snapshot["last_alert_at"])
+
+    def test_runtime_state_can_be_updated(self) -> None:
+        self.store.update_runtime_state(
+            monitor_running=True,
+            mode="replay",
+            warning="demo warning",
+            last_cycle=3,
+            last_message="Cycle 3 complete.",
+        )
+
+        runtime = self.store.runtime_state()
+
+        self.assertTrue(runtime["monitor_running"])
+        self.assertEqual(runtime["mode"], "replay")
+        self.assertEqual(runtime["warning"], "demo warning")
+        self.assertEqual(runtime["last_cycle"], 3)
+
+    def test_list_alerts_orders_mixed_timezone_timestamps_correctly(self) -> None:
+        aware_alert = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 0, 30, tzinfo=timezone.utc),
+            severity="HIGH",
+            rule_name="Port Scan",
+            description="scan",
+            src_ip="9.9.9.9",
+            dst_ip="10.0.0.10",
+            metadata={"x": "1"},
+        )
+        naive_alert = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 0, 0),
+            severity="MEDIUM",
+            rule_name="Traffic Burst",
+            description="burst",
+            src_ip="8.8.8.8",
+            dst_ip="10.0.0.20",
+            metadata={"bytes": "2000"},
+        )
+        self.store.save_alerts([naive_alert, aware_alert])
+
+        alerts = self.store.list_alerts()
+
+        self.assertEqual(alerts[0]["rule_name"], "Port Scan")
 
 
 if __name__ == "__main__":

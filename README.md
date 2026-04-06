@@ -144,9 +144,35 @@ Dashboard filters:
 Dashboard extras:
 
 - Click a rule name to open the full alert detail view
+- Live status, threat pressure, source tracking, and recent incident panels refresh automatically
+- Session-based login with automatic expiry
+- Basic login throttling for repeated failed attempts
+- Start the dashboard with `--input ...` or `--live` to run monitoring in the same process
 - Use `/api/summary` for summary JSON
 - Use `/api/alerts` for alert JSON
+- Use `/api/live` for recent live-tracking JSON
+- Use `/api/dashboard` for the full dashboard data payload
+- Use `/api/health` for a quick health check
 - Export directly from the dashboard with CSV and JSON links
+- Pagination and filter-preserving exports are built in
+
+Run the dashboard with live file monitoring:
+
+```bash
+python main.py dashboard --input sample_data/events.jsonl
+```
+
+Run the dashboard in demo replay mode so the sample file keeps generating fresh alerts:
+
+```bash
+python main.py dashboard --input sample_data/events.jsonl --replay
+```
+
+Run the dashboard with live packet capture:
+
+```bash
+python main.py dashboard --live --interface Ethernet
+```
 
 ## Export Alerts
 
