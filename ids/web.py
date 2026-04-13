@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from ids.config import IDSConfig
-from ids.security import verify_password
+from ids.security import create_jwt, decode_and_verify_jwt, verify_password
 from ids.storage import (
     AlertStore,
     ROLE_ADMIN,
@@ -21,7 +21,10 @@ from ids.storage import (
     VALID_ROLES,
 )
 
-SESSION_TTL_SECONDS = 30 * 60
+ACCESS_TOKEN_TTL_SECONDS = 15 * 60
+REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+ACCESS_TOKEN_COOKIE = "ids_access_token"
+REFRESH_TOKEN_COOKIE = "ids_refresh_token"
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 5 * 60
 
@@ -348,7 +351,6 @@ class DashboardServer(ThreadingHTTPServer):
         super().__init__(server_address, DashboardHandler)
         self.config = config
         self.store = store
-        self.sessions: dict[str, dict[str, object]] = {}
         self.login_attempts: dict[str, list[float]] = {}
 
 
@@ -356,6 +358,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server: DashboardServer
 
     def do_GET(self) -> None:
+        self._auth_context: dict[str, str] | None = None
+        self._pending_cookies: list[str] = []
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -396,12 +400,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_html(_reset_password_page(token))
             return
         if path == "/logout":
-            session_id = self._session_id()
-            if session_id:
-                self.server.sessions.pop(session_id, None)
+            refresh_token = self._cookie_value(REFRESH_TOKEN_COOKIE)
+            if refresh_token:
+                self.server.store.revoke_refresh_token(refresh_token)
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/login")
-            self.send_header("Set-Cookie", "ids_session=; Path=/; Max-Age=0; HttpOnly")
+            self.send_header(
+                "Set-Cookie",
+                f"{ACCESS_TOKEN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+            )
+            self.send_header(
+                "Set-Cookie",
+                f"{REFRESH_TOKEN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+            )
             self.end_headers()
             return
         if path == "/":
@@ -523,6 +534,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        self._auth_context = None
+        self._pending_cookies = []
         if self.path == "/api/alerts/ack":
             if not self._is_authenticated():
                 self._send_json({"error": "Authentication required."}, status=HTTPStatus.UNAUTHORIZED)
@@ -723,6 +736,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        self._apply_pending_cookies()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -732,6 +746,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(encoded)))
+        self._apply_pending_cookies()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -741,6 +756,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(encoded)))
+        self._apply_pending_cookies()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -776,6 +792,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/csv; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(encoded)))
+        self._apply_pending_cookies()
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -791,63 +808,128 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
+        self._apply_pending_cookies()
         self.end_headers()
 
-    def _session_id(self) -> str | None:
+    def _cookie_value(self, name: str) -> str | None:
         cookie_header = self.headers.get("Cookie")
         if not cookie_header:
             return None
         cookie = SimpleCookie()
         cookie.load(cookie_header)
-        morsel = cookie.get("ids_session")
+        morsel = cookie.get(name)
         return morsel.value if morsel else None
 
     def _start_session(self, *, username: str, role: str) -> None:
-        session_id = secrets.token_hex(16)
-        now = time.time()
+        access_token, refresh_token, refresh_exp = self._build_auth_tokens(username=username, role=role)
+        self.server.store.store_refresh_token(username=username, refresh_token=refresh_token, expires_at_epoch=refresh_exp)
+        self._queue_auth_cookies(access_token=access_token, refresh_token=refresh_token)
         normalized_role = role.strip().lower()
         if normalized_role not in VALID_ROLES:
             normalized_role = ROLE_VIEWER
-        self.server.sessions[session_id] = {
-            "expires_at": now + SESSION_TTL_SECONDS,
-            "username": username,
-            "role": normalized_role,
-        }
+        self._auth_context = {"username": username, "role": normalized_role}
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/")
-        self.send_header("Set-Cookie", f"ids_session={session_id}; Path=/; HttpOnly")
+        self._apply_pending_cookies()
         self.end_headers()
 
-    def _session(self) -> dict[str, object] | None:
-        session_id = self._session_id()
-        if not session_id:
+    def _build_auth_tokens(self, *, username: str, role: str) -> tuple[str, str, int]:
+        now_epoch = int(time.time())
+        normalized_role = role.strip().lower()
+        if normalized_role not in VALID_ROLES:
+            normalized_role = ROLE_VIEWER
+        access_payload: dict[str, object] = {
+            "sub": username,
+            "role": normalized_role,
+            "type": "access",
+            "iat": now_epoch,
+            "exp": now_epoch + ACCESS_TOKEN_TTL_SECONDS,
+        }
+        refresh_payload: dict[str, object] = {
+            "sub": username,
+            "role": normalized_role,
+            "type": "refresh",
+            "jti": secrets.token_hex(16),
+            "iat": now_epoch,
+            "exp": now_epoch + REFRESH_TOKEN_TTL_SECONDS,
+        }
+        access_token = create_jwt(access_payload, self.server.config.dashboard.secret_key)
+        refresh_token = create_jwt(refresh_payload, self.server.config.dashboard.secret_key)
+        return access_token, refresh_token, int(refresh_payload["exp"])
+
+    def _queue_auth_cookies(self, *, access_token: str, refresh_token: str) -> None:
+        self._pending_cookies.append(
+            f"{ACCESS_TOKEN_COOKIE}={access_token}; Path=/; HttpOnly; SameSite=Lax"
+        )
+        self._pending_cookies.append(
+            f"{REFRESH_TOKEN_COOKIE}={refresh_token}; Path=/; HttpOnly; SameSite=Lax"
+        )
+
+    def _apply_pending_cookies(self) -> None:
+        for cookie_value in self._pending_cookies:
+            self.send_header("Set-Cookie", cookie_value)
+        self._pending_cookies = []
+
+    def _auth_from_tokens(self) -> dict[str, str] | None:
+        access_token = self._cookie_value(ACCESS_TOKEN_COOKIE)
+        if access_token:
+            access_payload = decode_and_verify_jwt(
+                access_token,
+                self.server.config.dashboard.secret_key,
+            )
+            if access_payload and access_payload.get("type") == "access":
+                username = str(access_payload.get("sub", "")).strip()
+                role = str(access_payload.get("role", ROLE_VIEWER)).strip().lower()
+                if username:
+                    if role not in VALID_ROLES:
+                        role = ROLE_VIEWER
+                    return {"username": username, "role": role}
+
+        refresh_token = self._cookie_value(REFRESH_TOKEN_COOKIE)
+        if not refresh_token:
             return None
-        session = self.server.sessions.get(session_id)
-        if session is None:
+        refresh_payload = decode_and_verify_jwt(
+            refresh_token,
+            self.server.config.dashboard.secret_key,
+        )
+        if not refresh_payload or refresh_payload.get("type") != "refresh":
             return None
-        expires_at = float(session.get("expires_at", 0))
-        now = time.time()
-        if expires_at < now:
-            self.server.sessions.pop(session_id, None)
+
+        username = str(refresh_payload.get("sub", "")).strip()
+        if not username:
             return None
-        session["expires_at"] = now + SESSION_TTL_SECONDS
-        self.server.sessions[session_id] = session
-        return session
+        consumed_username = self.server.store.consume_refresh_token(refresh_token)
+        if consumed_username is None or consumed_username != username:
+            return None
+        role = self.server.store.get_user_role(username) or ROLE_VIEWER
+        new_access_token, new_refresh_token, refresh_exp = self._build_auth_tokens(
+            username=username,
+            role=role,
+        )
+        self.server.store.store_refresh_token(
+            username=username,
+            refresh_token=new_refresh_token,
+            expires_at_epoch=refresh_exp,
+        )
+        self._queue_auth_cookies(access_token=new_access_token, refresh_token=new_refresh_token)
+        return {"username": username, "role": role}
 
     def _is_authenticated(self) -> bool:
-        return self._session() is not None
+        if self._auth_context is None:
+            self._auth_context = self._auth_from_tokens()
+        return self._auth_context is not None
 
     def _current_username(self) -> str:
-        session = self._session()
-        if session is None:
+        if not self._is_authenticated():
             return ""
-        return str(session.get("username", ""))
+        assert self._auth_context is not None
+        return str(self._auth_context.get("username", ""))
 
     def _current_role(self) -> str:
-        session = self._session()
-        if session is None:
+        if not self._is_authenticated():
             return ROLE_VIEWER
-        role = str(session.get("role", ROLE_VIEWER)).strip().lower()
+        assert self._auth_context is not None
+        role = str(self._auth_context.get("role", ROLE_VIEWER)).strip().lower()
         if role not in VALID_ROLES:
             return ROLE_VIEWER
         return role

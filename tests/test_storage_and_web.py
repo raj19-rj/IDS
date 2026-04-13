@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import json
 import sqlite3
+import time
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -404,6 +405,18 @@ class StorageAndWebTests(unittest.TestCase):
 
         self.assertTrue(self.store.set_user_role("viewer1", "analyst"))
         self.assertEqual(self.store.get_user_role("viewer1"), "analyst")
+
+    def test_refresh_token_storage_and_consumption(self) -> None:
+        refresh_token = "test-refresh-token"
+        self.store.store_refresh_token(
+            username="viewer1",
+            refresh_token=refresh_token,
+            expires_at_epoch=int(time.time()) + 60,
+        )
+        consumed_username = self.store.consume_refresh_token(refresh_token)
+
+        self.assertEqual(consumed_username, "viewer1")
+        self.assertIsNone(self.store.consume_refresh_token(refresh_token))
 
 
 if __name__ == "__main__":
