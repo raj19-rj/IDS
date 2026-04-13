@@ -19,6 +19,11 @@ try:
 except ImportError:  # pragma: no cover - exercised only when dependency is missing
     bcrypt = None
 
+ROLE_ADMIN = "admin"
+ROLE_ANALYST = "analyst"
+ROLE_VIEWER = "viewer"
+VALID_ROLES = {ROLE_ADMIN, ROLE_ANALYST, ROLE_VIEWER}
+
 
 class AlertStore:
     def __init__(self, database_path: Path) -> None:
@@ -71,16 +76,20 @@ class AlertStore:
                 """
                 INSERT OR IGNORE INTO alerts (
                     fingerprint, timestamp, severity, rule_name,
-                    description, src_ip, dst_ip, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    description, src_ip, dst_ip, metadata_json,
+                    acknowledged, acknowledged_at, acknowledged_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                rows,
+                [(*row, 0, None, None) for row in rows],
             )
             connection.commit()
             return cursor.rowcount if cursor.rowcount is not None else 0
 
-    def create_user(self, username: str, password: str) -> bool:
+    def create_user(self, username: str, password: str, *, role: str = ROLE_ADMIN) -> bool:
         self._require_bcrypt()
+        normalized_role = role.strip().lower()
+        if normalized_role not in VALID_ROLES:
+            raise ValueError("role must be one of: admin, analyst, viewer")
         normalized_username = username.strip()
         if not normalized_username:
             raise ValueError("username cannot be empty")
@@ -98,11 +107,20 @@ class AlertStore:
                 connection.execute(
                     """
                     INSERT INTO users (
-                        username, email, password_hash, password_salt,
+                        username, email, role, password_hash, password_salt,
                         is_verified, created_at, verified_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (normalized_username, email, password_hash, password_salt, 1, created_at, created_at),
+                    (
+                        normalized_username,
+                        email,
+                        normalized_role,
+                        password_hash,
+                        password_salt,
+                        1,
+                        created_at,
+                        created_at,
+                    ),
                 )
                 connection.commit()
                 return True
@@ -113,15 +131,28 @@ class AlertStore:
         return self.authenticate_user(username=username, password=password, require_verified=False)
 
     def authenticate_user(self, username: str, password: str, *, require_verified: bool = True) -> bool:
+        return self.authenticate_user_with_role(
+            username=username,
+            password=password,
+            require_verified=require_verified,
+        ) is not None
+
+    def authenticate_user_with_role(
+        self,
+        username: str,
+        password: str,
+        *,
+        require_verified: bool = True,
+    ) -> str | None:
         self._require_bcrypt()
         normalized_username = username.strip()
         if not normalized_username or not password:
-            return False
+            return None
 
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT password_hash, password_salt, is_verified
+                SELECT password_hash, password_salt, is_verified, role
                 FROM users
                 WHERE username = ?
                 """,
@@ -130,14 +161,17 @@ class AlertStore:
             row = cursor.fetchone()
 
         if row is None:
-            return False
+            return None
 
         if require_verified and int(row["is_verified"]) != 1:
-            return False
+            return None
 
         stored_hash = str(row["password_hash"]).encode("utf-8")
         salted_password = f"{row['password_salt']}:{password}".encode("utf-8")
-        return bcrypt.checkpw(salted_password, stored_hash)
+        if not bcrypt.checkpw(salted_password, stored_hash):
+            return None
+        role = str(row["role"]).strip().lower()
+        return role if role in VALID_ROLES else ROLE_VIEWER
 
     def register_user(self, username: str, email: str, password: str) -> str | None:
         self._require_bcrypt()
@@ -164,13 +198,14 @@ class AlertStore:
                 cursor = connection.execute(
                     """
                     INSERT INTO users (
-                        username, email, password_hash, password_salt,
+                        username, email, role, password_hash, password_salt,
                         is_verified, created_at, verified_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_username,
                         normalized_email,
+                        ROLE_VIEWER,
                         password_hash,
                         password_salt,
                         0,
@@ -341,6 +376,72 @@ class AlertStore:
             ).fetchone()
         return bool(row and int(row[0]) > 0)
 
+    def get_user_role(self, username: str) -> str | None:
+        normalized_username = username.strip()
+        if not normalized_username:
+            return None
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT role FROM users WHERE username = ?",
+                (normalized_username,),
+            ).fetchone()
+        if row is None:
+            return None
+        role = str(row["role"]).strip().lower()
+        return role if role in VALID_ROLES else ROLE_VIEWER
+
+    def set_user_role(self, username: str, role: str) -> bool:
+        normalized_username = username.strip()
+        normalized_role = role.strip().lower()
+        if not normalized_username or normalized_role not in VALID_ROLES:
+            return False
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE users SET role = ? WHERE username = ?",
+                (normalized_role, normalized_username),
+            )
+            connection.commit()
+            return bool(cursor.rowcount)
+
+    def list_users(self) -> list[dict[str, object]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT username, email, role, is_verified, created_at, verified_at
+                FROM users
+                ORDER BY created_at ASC, username ASC
+                """
+            ).fetchall()
+        return [
+            {
+                "username": str(row["username"]),
+                "email": str(row["email"]),
+                "role": str(row["role"]),
+                "is_verified": bool(int(row["is_verified"])),
+                "created_at": str(row["created_at"]),
+                "verified_at": str(row["verified_at"]) if row["verified_at"] is not None else None,
+            }
+            for row in rows
+        ]
+
+    def acknowledge_alert(self, fingerprint: str, acknowledged_by: str) -> bool:
+        normalized_fingerprint = fingerprint.strip()
+        normalized_ack_by = acknowledged_by.strip()
+        if not normalized_fingerprint or not normalized_ack_by:
+            return False
+        acknowledged_at = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE alerts
+                SET acknowledged = 1, acknowledged_at = ?, acknowledged_by = ?
+                WHERE fingerprint = ? AND acknowledged = 0
+                """,
+                (acknowledged_at, normalized_ack_by, normalized_fingerprint),
+            )
+            connection.commit()
+            return bool(cursor.rowcount)
+
     def list_alerts(
         self,
         limit: int = 100,
@@ -370,7 +471,9 @@ class AlertStore:
         )
 
         query = f"""
-            SELECT fingerprint, timestamp, severity, rule_name, description, src_ip, dst_ip, metadata_json
+            SELECT
+                fingerprint, timestamp, severity, rule_name, description,
+                src_ip, dst_ip, metadata_json, acknowledged, acknowledged_at, acknowledged_by
             FROM alerts
             {where_clause}
             ORDER BY {safe_sort_column} {safe_sort_dir}, fingerprint {safe_sort_dir}
@@ -404,7 +507,9 @@ class AlertStore:
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT fingerprint, timestamp, severity, rule_name, description, src_ip, dst_ip, metadata_json
+                SELECT
+                    fingerprint, timestamp, severity, rule_name, description,
+                    src_ip, dst_ip, metadata_json, acknowledged, acknowledged_at, acknowledged_by
                 FROM alerts
                 WHERE fingerprint = ?
                 """,
@@ -679,7 +784,10 @@ class AlertStore:
                 description TEXT NOT NULL,
                 src_ip TEXT NOT NULL,
                 dst_ip TEXT NOT NULL,
-                metadata_json TEXT NOT NULL
+                metadata_json TEXT NOT NULL,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                acknowledged_at TEXT,
+                acknowledged_by TEXT
             )
             """
         )
@@ -689,6 +797,7 @@ class AlertStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
                 email TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL DEFAULT 'viewer',
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
                 is_verified INTEGER NOT NULL DEFAULT 0,
@@ -697,7 +806,9 @@ class AlertStore:
             )
             """
         )
+        self._ensure_alerts_columns(connection)
         self._ensure_users_columns(connection)
+        self._ensure_admin_exists(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS email_verification_tokens (
@@ -741,6 +852,7 @@ class AlertStore:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_rule_name ON alerts(rule_name)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_verify_tokens_user ON email_verification_tokens(user_id)"
         )
@@ -796,10 +908,11 @@ class AlertStore:
                 """
                 INSERT OR IGNORE INTO alerts (
                     fingerprint, timestamp, severity, rule_name,
-                    description, src_ip, dst_ip, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    description, src_ip, dst_ip, metadata_json,
+                    acknowledged, acknowledged_at, acknowledged_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                legacy_rows,
+                [(*row, 0, None, None) for row in legacy_rows],
             )
             connection.commit()
 
@@ -844,7 +957,9 @@ class AlertStore:
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT fingerprint, timestamp, severity, rule_name, description, src_ip, dst_ip, metadata_json
+                SELECT
+                    fingerprint, timestamp, severity, rule_name, description,
+                    src_ip, dst_ip, metadata_json, acknowledged, acknowledged_at, acknowledged_by
                 FROM alerts
                 ORDER BY timestamp DESC, fingerprint DESC
                 """
@@ -869,6 +984,13 @@ class AlertStore:
             "src_ip": str(row["src_ip"]),
             "dst_ip": str(row["dst_ip"]),
             "metadata": metadata,
+            "acknowledged": bool(int(row["acknowledged"])) if row["acknowledged"] is not None else False,
+            "acknowledged_at": (
+                str(row["acknowledged_at"]) if row["acknowledged_at"] is not None else None
+            ),
+            "acknowledged_by": (
+                str(row["acknowledged_by"]) if row["acknowledged_by"] is not None else None
+            ),
         }
 
     def _parse_timestamp(self, value: str) -> datetime:
@@ -896,6 +1018,48 @@ class AlertStore:
             connection.execute(
                 "UPDATE users SET verified_at = created_at WHERE verified_at IS NULL AND is_verified = 1"
             )
+        if "role" not in existing_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN role TEXT")
+            connection.execute(
+                "UPDATE users SET role = ? WHERE role IS NULL OR TRIM(role) = ''",
+                (ROLE_VIEWER,),
+            )
+
+    def _ensure_alerts_columns(self, connection: sqlite3.Connection) -> None:
+        existing_columns = {
+            str(row[1]): row
+            for row in connection.execute("PRAGMA table_info(alerts)").fetchall()
+        }
+        if "acknowledged" not in existing_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")
+            connection.execute("UPDATE alerts SET acknowledged = 0 WHERE acknowledged IS NULL")
+        if "acknowledged_at" not in existing_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT")
+        if "acknowledged_by" not in existing_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN acknowledged_by TEXT")
+
+    def _ensure_admin_exists(self, connection: sqlite3.Connection) -> None:
+        admin_count = connection.execute(
+            "SELECT COUNT(*) FROM users WHERE LOWER(role) = ?",
+            (ROLE_ADMIN,),
+        ).fetchone()
+        if admin_count and int(admin_count[0]) > 0:
+            return
+        oldest_verified = connection.execute(
+            """
+            SELECT id
+            FROM users
+            WHERE is_verified = 1
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if oldest_verified is None:
+            return
+        connection.execute(
+            "UPDATE users SET role = ? WHERE id = ?",
+            (ROLE_ADMIN, int(oldest_verified["id"])),
+        )
 
     def _hash_token(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()

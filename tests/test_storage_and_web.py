@@ -277,6 +277,7 @@ class StorageAndWebTests(unittest.TestCase):
         column_names = {str(column[1]) for column in columns}
         self.assertIn("username", column_names)
         self.assertIn("email", column_names)
+        self.assertIn("role", column_names)
         self.assertIn("password_hash", column_names)
         self.assertIn("password_salt", column_names)
         self.assertIn("is_verified", column_names)
@@ -368,6 +369,41 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0]["recipient_email"], "soc@example.com")
         self.assertEqual(messages[0]["subject"], "Verification")
+
+    def test_alert_acknowledgement_updates_fields(self) -> None:
+        alert = Alert(
+            timestamp=datetime(2026, 4, 1, 12, 0, 0),
+            severity="HIGH",
+            rule_name="Port Scan",
+            description="scan",
+            src_ip="1.2.3.4",
+            dst_ip="10.0.0.10",
+            metadata={"x": "1"},
+        )
+        self.store.save_alerts([alert])
+
+        self.assertTrue(self.store.acknowledge_alert(alert.fingerprint, "analyst1"))
+        self.assertFalse(self.store.acknowledge_alert(alert.fingerprint, "analyst2"))
+        fetched = self.store.get_alert(alert.fingerprint)
+
+        self.assertIsNotNone(fetched)
+        assert fetched is not None
+        self.assertTrue(bool(fetched["acknowledged"]))
+        self.assertEqual(str(fetched["acknowledged_by"]), "analyst1")
+        self.assertIsNotNone(fetched["acknowledged_at"])
+
+    def test_role_defaults_and_changes(self) -> None:
+        if _bcrypt is None:
+            self.skipTest("bcrypt is not installed")
+        token = self.store.register_user("viewer1", "viewer1@example.com", "ViewerPass!123")
+        assert token is not None
+        self.assertEqual(self.store.get_user_role("viewer1"), "viewer")
+
+        self.assertTrue(self.store.create_user("opsadmin", "AdminPass!123", role="admin"))
+        self.assertEqual(self.store.get_user_role("opsadmin"), "admin")
+
+        self.assertTrue(self.store.set_user_role("viewer1", "analyst"))
+        self.assertEqual(self.store.get_user_role("viewer1"), "analyst")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,13 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from ids.config import IDSConfig
 from ids.security import verify_password
-from ids.storage import AlertStore
+from ids.storage import (
+    AlertStore,
+    ROLE_ADMIN,
+    ROLE_ANALYST,
+    ROLE_VIEWER,
+    VALID_ROLES,
+)
 
 SESSION_TTL_SECONDS = 30 * 60
 MAX_LOGIN_ATTEMPTS = 5
@@ -342,7 +348,7 @@ class DashboardServer(ThreadingHTTPServer):
         super().__init__(server_address, DashboardHandler)
         self.config = config
         self.store = store
-        self.sessions: dict[str, float] = {}
+        self.sessions: dict[str, dict[str, object]] = {}
         self.login_attempts: dict[str, list[float]] = {}
 
 
@@ -446,6 +452,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(self.server.store.summary())
             return
+        if path == "/api/me":
+            if not self._is_authenticated():
+                self._redirect("/login")
+                return
+            self._send_json(
+                {
+                    "username": self._current_username(),
+                    "role": self._current_role(),
+                }
+            )
+            return
         if path == "/api/alerts":
             if not self._is_authenticated():
                 self._redirect("/login")
@@ -472,8 +489,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "total_filtered": total_filtered,
                     "page": filters["page"],
                     "limit": filters["limit"],
+                    "current_role": self._current_role(),
                 }
             )
+            return
+        if path == "/api/users":
+            if not self._is_authenticated():
+                self._redirect("/login")
+                return
+            if not self._require_role(ROLE_ADMIN):
+                return
+            self._send_json({"users": self.server.store.list_users()})
             return
         if path == "/export":
             if not self._is_authenticated():
@@ -497,6 +523,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if self.path == "/api/alerts/ack":
+            if not self._is_authenticated():
+                self._send_json({"error": "Authentication required."}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            if not self._require_role(ROLE_ADMIN, ROLE_ANALYST):
+                return
+            fields = self._read_form_fields()
+            fingerprint = fields.get("fingerprint", [""])[0].strip()
+            actor = self._current_username() or "unknown"
+            if not fingerprint:
+                self._send_json({"error": "fingerprint is required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            acknowledged = self.server.store.acknowledge_alert(fingerprint=fingerprint, acknowledged_by=actor)
+            if not acknowledged:
+                self._send_json(
+                    {"error": "Alert not found or already acknowledged."},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._send_json({"status": "ok", "fingerprint": fingerprint, "acknowledged_by": actor})
+            return
+
+        if self.path == "/api/users/role":
+            if not self._is_authenticated():
+                self._send_json({"error": "Authentication required."}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            if not self._require_role(ROLE_ADMIN):
+                return
+            fields = self._read_form_fields()
+            username = fields.get("username", [""])[0].strip()
+            role = fields.get("role", [""])[0].strip().lower()
+            if not username or role not in VALID_ROLES:
+                self._send_json(
+                    {
+                        "error": "username and valid role are required.",
+                        "valid_roles": sorted(VALID_ROLES),
+                    },
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if not self.server.store.set_user_role(username=username, role=role):
+                self._send_json({"error": "User not found or update failed."}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json({"status": "ok", "username": username, "role": role})
+            return
+
         if self.path not in {"/login", "/register", "/forgot-password", "/reset-password"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -619,14 +691,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         username = fields.get("username", [""])[0]
         password = fields.get("password", [""])[0]
 
-        if self.server.store.authenticate_user(username=username, password=password):
-            session_id = secrets.token_hex(16)
-            self.server.sessions[session_id] = time.time() + SESSION_TTL_SECONDS
+        role = self.server.store.authenticate_user_with_role(username=username, password=password)
+        if role is not None:
+            self._start_session(username=username, role=role)
             self.server.login_attempts.pop(client_ip, None)
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.send_header("Set-Cookie", f"ids_session={session_id}; Path=/; HttpOnly")
-            self.end_headers()
             return
 
         if username == self.server.config.dashboard.username and verify_password(
@@ -634,13 +702,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             salt=self.server.config.dashboard.password_salt,
             password_hash=self.server.config.dashboard.password_hash,
         ):
-            session_id = secrets.token_hex(16)
-            self.server.sessions[session_id] = time.time() + SESSION_TTL_SECONDS
+            self._start_session(username=username, role=ROLE_ADMIN)
             self.server.login_attempts.pop(client_ip, None)
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.send_header("Set-Cookie", f"ids_session={session_id}; Path=/; HttpOnly")
-            self.end_headers()
             return
 
         self._record_failed_attempt(client_ip)
@@ -739,17 +802,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
         morsel = cookie.get("ids_session")
         return morsel.value if morsel else None
 
-    def _is_authenticated(self) -> bool:
+    def _start_session(self, *, username: str, role: str) -> None:
+        session_id = secrets.token_hex(16)
+        now = time.time()
+        normalized_role = role.strip().lower()
+        if normalized_role not in VALID_ROLES:
+            normalized_role = ROLE_VIEWER
+        self.server.sessions[session_id] = {
+            "expires_at": now + SESSION_TTL_SECONDS,
+            "username": username,
+            "role": normalized_role,
+        }
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", f"ids_session={session_id}; Path=/; HttpOnly")
+        self.end_headers()
+
+    def _session(self) -> dict[str, object] | None:
         session_id = self._session_id()
         if not session_id:
-            return False
-        expiry = self.server.sessions.get(session_id)
+            return None
+        session = self.server.sessions.get(session_id)
+        if session is None:
+            return None
+        expires_at = float(session.get("expires_at", 0))
         now = time.time()
-        if expiry is None or expiry < now:
+        if expires_at < now:
             self.server.sessions.pop(session_id, None)
-            return False
-        self.server.sessions[session_id] = now + SESSION_TTL_SECONDS
-        return True
+            return None
+        session["expires_at"] = now + SESSION_TTL_SECONDS
+        self.server.sessions[session_id] = session
+        return session
+
+    def _is_authenticated(self) -> bool:
+        return self._session() is not None
+
+    def _current_username(self) -> str:
+        session = self._session()
+        if session is None:
+            return ""
+        return str(session.get("username", ""))
+
+    def _current_role(self) -> str:
+        session = self._session()
+        if session is None:
+            return ROLE_VIEWER
+        role = str(session.get("role", ROLE_VIEWER)).strip().lower()
+        if role not in VALID_ROLES:
+            return ROLE_VIEWER
+        return role
+
+    def _require_role(self, *allowed_roles: str) -> bool:
+        current_role = self._current_role()
+        normalized_allowed = {role.strip().lower() for role in allowed_roles}
+        if current_role in normalized_allowed:
+            return True
+        self._send_json(
+            {
+                "error": "Forbidden: insufficient role for this action.",
+                "required_roles": sorted(normalized_allowed),
+                "current_role": current_role,
+            },
+            status=HTTPStatus.FORBIDDEN,
+        )
+        return False
 
     def _extract_filters(self, query: dict[str, list[str]]) -> dict[str, str | int]:
         limit_text = query.get("limit", ["50"])[0].strip() or "50"
@@ -801,6 +917,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "summary": self.server.store.summary(),
             "live": self.server.store.live_snapshot(window_minutes=int(filters["window"])),
             "runtime": self.server.store.runtime_state(),
+            "current_user": {
+                "username": self._current_username(),
+                "role": self._current_role(),
+            },
             "alerts": self.server.store.list_alerts(
                 limit=filters["limit"],
                 offset=offset,
