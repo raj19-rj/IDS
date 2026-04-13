@@ -91,15 +91,18 @@ class AlertStore:
         salted_password = f"{password_salt}:{password}".encode("utf-8")
         password_hash = bcrypt.hashpw(salted_password, bcrypt.gensalt()).decode("utf-8")
         created_at = datetime.now(timezone.utc).isoformat()
+        email = f"{normalized_username}@local.invalid"
 
         try:
             with self._lock, self._connection() as connection:
                 connection.execute(
                     """
-                    INSERT INTO users (username, password_hash, password_salt, created_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO users (
+                        username, email, password_hash, password_salt,
+                        is_verified, created_at, verified_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (normalized_username, password_hash, password_salt, created_at),
+                    (normalized_username, email, password_hash, password_salt, 1, created_at, created_at),
                 )
                 connection.commit()
                 return True
@@ -107,6 +110,9 @@ class AlertStore:
             return False
 
     def verify_user_password(self, username: str, password: str) -> bool:
+        return self.authenticate_user(username=username, password=password, require_verified=False)
+
+    def authenticate_user(self, username: str, password: str, *, require_verified: bool = True) -> bool:
         self._require_bcrypt()
         normalized_username = username.strip()
         if not normalized_username or not password:
@@ -115,7 +121,7 @@ class AlertStore:
         with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
-                SELECT password_hash, password_salt
+                SELECT password_hash, password_salt, is_verified
                 FROM users
                 WHERE username = ?
                 """,
@@ -126,9 +132,214 @@ class AlertStore:
         if row is None:
             return False
 
+        if require_verified and int(row["is_verified"]) != 1:
+            return False
+
         stored_hash = str(row["password_hash"]).encode("utf-8")
         salted_password = f"{row['password_salt']}:{password}".encode("utf-8")
         return bcrypt.checkpw(salted_password, stored_hash)
+
+    def register_user(self, username: str, email: str, password: str) -> str | None:
+        self._require_bcrypt()
+        normalized_username = username.strip()
+        normalized_email = email.strip().lower()
+        if not normalized_username:
+            raise ValueError("username cannot be empty")
+        if not normalized_email:
+            raise ValueError("email cannot be empty")
+        if not password:
+            raise ValueError("password cannot be empty")
+
+        password_salt = secrets.token_hex(16)
+        salted_password = f"{password_salt}:{password}".encode("utf-8")
+        password_hash = bcrypt.hashpw(salted_password, bcrypt.gensalt()).decode("utf-8")
+        now = datetime.now(timezone.utc)
+        created_at = now.isoformat()
+        token = secrets.token_urlsafe(32)
+        token_hash = self._hash_token(token)
+        expires_at = (now + timedelta(hours=24)).isoformat()
+
+        try:
+            with self._lock, self._connection() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO users (
+                        username, email, password_hash, password_salt,
+                        is_verified, created_at, verified_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        normalized_username,
+                        normalized_email,
+                        password_hash,
+                        password_salt,
+                        0,
+                        created_at,
+                        None,
+                    ),
+                )
+                user_id = int(cursor.lastrowid)
+                connection.execute(
+                    """
+                    INSERT INTO email_verification_tokens (
+                        user_id, token_hash, created_at, expires_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (user_id, token_hash, created_at, expires_at, None),
+                )
+                connection.commit()
+                return token
+        except sqlite3.IntegrityError:
+            return None
+
+    def consume_email_verification_token(self, token: str) -> bool:
+        token_hash = self._hash_token(token)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, user_id, expires_at, consumed_at
+                FROM email_verification_tokens
+                WHERE token_hash = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["consumed_at"] is not None:
+                return False
+            if str(row["expires_at"]) < now:
+                return False
+
+            connection.execute(
+                "UPDATE email_verification_tokens SET consumed_at = ? WHERE id = ?",
+                (now, int(row["id"])),
+            )
+            connection.execute(
+                "UPDATE users SET is_verified = 1, verified_at = ? WHERE id = ?",
+                (now, int(row["user_id"])),
+            )
+            connection.commit()
+            return True
+
+    def create_password_reset_token(self, email: str) -> str | None:
+        normalized_email = email.strip().lower()
+        if not normalized_email:
+            return None
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        expires_at = (now + timedelta(minutes=30)).isoformat()
+        token = secrets.token_urlsafe(32)
+        token_hash = self._hash_token(token)
+        with self._lock, self._connection() as connection:
+            user_row = connection.execute(
+                """
+                SELECT id, is_verified
+                FROM users
+                WHERE email = ?
+                """,
+                (normalized_email,),
+            ).fetchone()
+            if user_row is None:
+                return None
+            if int(user_row["is_verified"]) != 1:
+                return None
+            connection.execute(
+                """
+                INSERT INTO password_reset_tokens (
+                    user_id, token_hash, created_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(user_row["id"]), token_hash, now_text, expires_at, None),
+            )
+            connection.commit()
+            return token
+
+    def reset_password_with_token(self, token: str, new_password: str) -> bool:
+        self._require_bcrypt()
+        if not new_password:
+            raise ValueError("new_password cannot be empty")
+        token_hash = self._hash_token(token)
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, user_id, expires_at, consumed_at
+                FROM password_reset_tokens
+                WHERE token_hash = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["consumed_at"] is not None:
+                return False
+            if str(row["expires_at"]) < now:
+                return False
+
+            password_salt = secrets.token_hex(16)
+            salted_password = f"{password_salt}:{new_password}".encode("utf-8")
+            password_hash = bcrypt.hashpw(salted_password, bcrypt.gensalt()).decode("utf-8")
+
+            connection.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, password_salt = ?
+                WHERE id = ?
+                """,
+                (password_hash, password_salt, int(row["user_id"])),
+            )
+            connection.execute(
+                "UPDATE password_reset_tokens SET consumed_at = ? WHERE id = ?",
+                (now, int(row["id"])),
+            )
+            connection.commit()
+            return True
+
+    def queue_outbound_email(self, recipient_email: str, subject: str, body: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO outbound_emails (recipient_email, subject, body, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (recipient_email.strip().lower(), subject, body, now),
+            )
+            connection.commit()
+
+    def list_outbound_emails(self, limit: int = 20) -> list[dict[str, str]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT recipient_email, subject, body, created_at
+                FROM outbound_emails
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            {
+                "recipient_email": str(row["recipient_email"]),
+                "subject": str(row["subject"]),
+                "body": str(row["body"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def has_verified_users(self) -> bool:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE is_verified = 1"
+            ).fetchone()
+        return bool(row and int(row[0]) > 0)
 
     def list_alerts(
         self,
@@ -477,8 +688,49 @@ class AlertStore:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
+                is_verified INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                verified_at TEXT
+            )
+            """
+        )
+        self._ensure_users_columns(connection)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_verification_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbound_emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_email TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
             """
@@ -488,6 +740,16 @@ class AlertStore:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_src_ip ON alerts(src_ip)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_rule_name ON alerts(rule_name)")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_verify_tokens_user ON email_verification_tokens(user_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_email_created ON outbound_emails(created_at)"
+        )
 
     def _migrate_legacy_jsonl(self, legacy_path: Path) -> None:
         if not legacy_path.exists():
@@ -614,6 +876,29 @@ class AlertStore:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    def _ensure_users_columns(self, connection: sqlite3.Connection) -> None:
+        existing_columns = {
+            str(row[1]): row
+            for row in connection.execute("PRAGMA table_info(users)").fetchall()
+        }
+
+        if "email" not in existing_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            connection.execute(
+                "UPDATE users SET email = username || '@local.invalid' WHERE email IS NULL OR email = ''"
+            )
+        if "is_verified" not in existing_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER NOT NULL DEFAULT 1")
+            connection.execute("UPDATE users SET is_verified = 1 WHERE is_verified IS NULL")
+        if "verified_at" not in existing_columns:
+            connection.execute("ALTER TABLE users ADD COLUMN verified_at TEXT")
+            connection.execute(
+                "UPDATE users SET verified_at = created_at WHERE verified_at IS NULL AND is_verified = 1"
+            )
+
+    def _hash_token(self, token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     def _require_bcrypt(self) -> None:
         if bcrypt is None:

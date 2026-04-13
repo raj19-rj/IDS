@@ -276,9 +276,12 @@ class StorageAndWebTests(unittest.TestCase):
 
         column_names = {str(column[1]) for column in columns}
         self.assertIn("username", column_names)
+        self.assertIn("email", column_names)
         self.assertIn("password_hash", column_names)
         self.assertIn("password_salt", column_names)
+        self.assertIn("is_verified", column_names)
         self.assertIn("created_at", column_names)
+        self.assertIn("verified_at", column_names)
 
     def test_create_user_and_verify_password(self) -> None:
         if _bcrypt is None:
@@ -308,6 +311,63 @@ class StorageAndWebTests(unittest.TestCase):
         users = {str(row[0]): {"hash": str(row[1]), "salt": str(row[2])} for row in rows}
         self.assertNotEqual(users["alice"]["salt"], users["bob"]["salt"])
         self.assertNotEqual(users["alice"]["hash"], users["bob"]["hash"])
+
+    def test_register_verify_and_authenticate_flow(self) -> None:
+        if _bcrypt is None:
+            self.skipTest("bcrypt is not installed")
+        token = self.store.register_user(
+            username="newanalyst",
+            email="analyst@example.com",
+            password="TempPassword!123",
+        )
+
+        self.assertIsNotNone(token)
+        assert token is not None
+        self.assertFalse(
+            self.store.authenticate_user(
+                username="newanalyst",
+                password="TempPassword!123",
+            )
+        )
+        self.assertTrue(self.store.consume_email_verification_token(token))
+        self.assertTrue(
+            self.store.authenticate_user(
+                username="newanalyst",
+                password="TempPassword!123",
+            )
+        )
+
+    def test_password_reset_flow(self) -> None:
+        if _bcrypt is None:
+            self.skipTest("bcrypt is not installed")
+        token = self.store.register_user(
+            username="resetuser",
+            email="reset@example.com",
+            password="OldPassword!123",
+        )
+        assert token is not None
+        self.assertTrue(self.store.consume_email_verification_token(token))
+
+        reset_token = self.store.create_password_reset_token("reset@example.com")
+        self.assertIsNotNone(reset_token)
+        assert reset_token is not None
+
+        self.assertTrue(self.store.reset_password_with_token(reset_token, "NewPassword!456"))
+        self.assertFalse(self.store.reset_password_with_token(reset_token, "AnotherPassword!789"))
+        self.assertFalse(self.store.authenticate_user("resetuser", "OldPassword!123"))
+        self.assertTrue(self.store.authenticate_user("resetuser", "NewPassword!456"))
+
+    def test_outbound_email_queue_records_messages(self) -> None:
+        self.store.queue_outbound_email(
+            recipient_email="SOC@example.com",
+            subject="Verification",
+            body="Verify here",
+        )
+        messages = self.store.list_outbound_emails(limit=5)
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["recipient_email"], "soc@example.com")
+        self.assertEqual(messages[0]["subject"], "Verification")
 
 
 if __name__ == "__main__":

@@ -35,18 +35,19 @@ def _json_script_payload(payload: object) -> str:
     return json.dumps(payload).replace("</", "<\\/")
 
 
-def _login_page(error: str = "", warning: str = "") -> str:
+def _auth_shell(title: str, subtitle: str, form_html: str, *, error: str = "", warning: str = "", info: str = "") -> str:
     error_html = f'<p class="notice error">{escape(error)}</p>' if error else ""
     warning_html = f'<p class="notice warn">{escape(warning)}</p>' if warning else ""
+    info_html = f'<p class="notice info">{escape(info)}</p>' if info else ""
     return f"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>IDS Login</title>
+  <title>{escape(title)}</title>
   <style>
-    :root {{ --ink:#10233f; --muted:#5b6f8f; --card:rgba(255,255,255,0.95); --bg1:#f6efe2; --bg2:#dce9ff; --danger:#8a1f1f; --warn:#8a5a00; }}
+    :root {{ --ink:#10233f; --muted:#5b6f8f; --card:rgba(255,255,255,0.95); --bg1:#f6efe2; --bg2:#dce9ff; --danger:#8a1f1f; --warn:#8a5a00; --info:#1f4c8a; }}
     body {{ font-family: Georgia, serif; background:
       radial-gradient(circle at top left, rgba(182,77,43,0.18), transparent 28%),
       linear-gradient(135deg, var(--bg1), var(--bg2)); color: var(--ink); padding: 2rem; min-height:100vh; box-sizing:border-box; }}
@@ -56,28 +57,114 @@ def _login_page(error: str = "", warning: str = "") -> str:
     label {{ display:block; margin-top: 0.9rem; font-weight: bold; }}
     input {{ width: 100%; padding: 0.8rem; margin-top: 0.35rem; border-radius: 12px; border: 1px solid #9db4d3; box-sizing: border-box; }}
     button {{ width: 100%; padding: 0.9rem; border: 0; border-radius: 12px; background: #10233f; color: white; font-weight: bold; margin-top: 1rem; }}
+    a {{ color: #1d3f75; }}
+    .links {{ margin-top: 0.9rem; display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }}
     .notice {{ border-radius: 12px; padding: 0.8rem 1rem; }}
     .error {{ background: rgba(138,31,31,0.08); color: var(--danger); }}
     .warn {{ background: rgba(138,90,0,0.08); color: var(--warn); }}
+    .info {{ background: rgba(31,76,138,0.08); color: var(--info); }}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>IDS Dashboard</h1>
-    <p class="lead">Sign in to review alerts, investigate details, and export findings.</p>
+    <h1>{escape(title)}</h1>
+    <p class="lead">{escape(subtitle)}</p>
     {warning_html}
+    {info_html}
     {error_html}
-    <form method="post" action="/login">
-      <label>Username</label>
-      <input name="username" autocomplete="username">
-      <label>Password</label>
-      <input name="password" type="password" autocomplete="current-password">
-      <button type="submit">Sign In</button>
-    </form>
+    {form_html}
   </div>
 </body>
 </html>
 """
+
+
+def _login_page(error: str = "", warning: str = "", info: str = "") -> str:
+    return _auth_shell(
+        "IDS Dashboard",
+        "Sign in to review alerts, investigate details, and export findings.",
+        """
+        <form method="post" action="/login">
+          <label>Username</label>
+          <input name="username" autocomplete="username">
+          <label>Password</label>
+          <input name="password" type="password" autocomplete="current-password">
+          <button type="submit">Sign In</button>
+        </form>
+        <div class="links">
+          <a href="/register">Create account</a>
+          <a href="/forgot-password">Forgot password?</a>
+        </div>
+        """,
+        error=error,
+        warning=warning,
+        info=info,
+    )
+
+
+def _register_page(error: str = "", warning: str = "", info: str = "") -> str:
+    return _auth_shell(
+        "Create Account",
+        "Register with your email to activate dashboard access.",
+        """
+        <form method="post" action="/register">
+          <label>Username</label>
+          <input name="username" autocomplete="username">
+          <label>Email</label>
+          <input name="email" type="email" autocomplete="email">
+          <label>Password</label>
+          <input name="password" type="password" autocomplete="new-password">
+          <button type="submit">Create Account</button>
+        </form>
+        <div class="links">
+          <a href="/login">Back to sign in</a>
+        </div>
+        """,
+        error=error,
+        warning=warning,
+        info=info,
+    )
+
+
+def _forgot_password_page(error: str = "", warning: str = "", info: str = "") -> str:
+    return _auth_shell(
+        "Reset Password",
+        "Enter your verified account email to receive a reset link.",
+        """
+        <form method="post" action="/forgot-password">
+          <label>Email</label>
+          <input name="email" type="email" autocomplete="email">
+          <button type="submit">Send Reset Link</button>
+        </form>
+        <div class="links">
+          <a href="/login">Back to sign in</a>
+        </div>
+        """,
+        error=error,
+        warning=warning,
+        info=info,
+    )
+
+
+def _reset_password_page(token: str, error: str = "", warning: str = "", info: str = "") -> str:
+    return _auth_shell(
+        "Choose New Password",
+        "Set a new password for your account.",
+        f"""
+        <form method="post" action="/reset-password">
+          <input type="hidden" name="token" value="{escape(token)}">
+          <label>New Password</label>
+          <input name="password" type="password" autocomplete="new-password">
+          <button type="submit">Update Password</button>
+        </form>
+        <div class="links">
+          <a href="/login">Back to sign in</a>
+        </div>
+        """,
+        error=error,
+        warning=warning,
+        info=info,
+    )
 
 
 def _dashboard_page(
@@ -270,6 +357,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/login":
             self._send_html(_login_page(warning=self._demo_warning()))
             return
+        if path == "/register":
+            self._send_html(_register_page(warning=self._demo_warning()))
+            return
+        if path == "/verify-email":
+            token = query.get("token", [""])[0].strip()
+            if not token:
+                self._send_html(_login_page(error="Verification token is missing."))
+                return
+            if self.server.store.consume_email_verification_token(token):
+                self._send_html(
+                    _login_page(info="Email verified successfully. You can sign in now."),
+                    status=HTTPStatus.OK,
+                )
+                return
+            self._send_html(
+                _login_page(error="Verification link is invalid or expired."),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if path == "/forgot-password":
+            self._send_html(_forgot_password_page())
+            return
+        if path == "/reset-password":
+            token = query.get("token", [""])[0].strip()
+            if not token:
+                self._send_html(
+                    _forgot_password_page(error="Reset token is missing."),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self._send_html(_reset_password_page(token))
+            return
         if path == "/logout":
             session_id = self._session_id()
             if session_id:
@@ -378,8 +497,112 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        if self.path != "/login":
+        if self.path not in {"/login", "/register", "/forgot-password", "/reset-password"}:
             self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        fields = self._read_form_fields()
+        if self.path == "/register":
+            username = fields.get("username", [""])[0].strip()
+            email = fields.get("email", [""])[0].strip()
+            password = fields.get("password", [""])[0]
+            if not username or not email or not password:
+                self._send_html(
+                    _register_page(error="Username, email, and password are required."),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                token = self.server.store.register_user(username=username, email=email, password=password)
+            except RuntimeError as error:
+                self._send_html(_register_page(error=str(error)), status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            except ValueError as error:
+                self._send_html(_register_page(error=str(error)), status=HTTPStatus.BAD_REQUEST)
+                return
+
+            if token is None:
+                self._send_html(
+                    _register_page(error="Username or email already exists."),
+                    status=HTTPStatus.CONFLICT,
+                )
+                return
+
+            verification_url = f"{self._request_origin()}/verify-email?token={token}"
+            self.server.store.queue_outbound_email(
+                recipient_email=email,
+                subject="Verify your IDS dashboard account",
+                body=(
+                    "Please verify your email to activate your account:\n"
+                    f"{verification_url}\n\n"
+                    "This link expires in 24 hours."
+                ),
+            )
+            self._send_html(
+                _login_page(info="Registration complete. Check your email for a verification link."),
+                status=HTTPStatus.CREATED,
+            )
+            return
+
+        if self.path == "/forgot-password":
+            email = fields.get("email", [""])[0].strip()
+            reset_token = self.server.store.create_password_reset_token(email)
+            if reset_token:
+                reset_url = f"{self._request_origin()}/reset-password?token={reset_token}"
+                self.server.store.queue_outbound_email(
+                    recipient_email=email,
+                    subject="Reset your IDS dashboard password",
+                    body=(
+                        "Use this secure link to reset your password:\n"
+                        f"{reset_url}\n\n"
+                        "This link expires in 30 minutes."
+                    ),
+                )
+            self._send_html(
+                _forgot_password_page(
+                    info=(
+                        "If the email is registered and verified, a reset link has been sent."
+                    )
+                ),
+                status=HTTPStatus.OK,
+            )
+            return
+
+        if self.path == "/reset-password":
+            token = fields.get("token", [""])[0].strip()
+            password = fields.get("password", [""])[0]
+            if not token or not password:
+                self._send_html(
+                    _reset_password_page(token, error="Token and password are required."),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                changed = self.server.store.reset_password_with_token(token, password)
+            except RuntimeError as error:
+                self._send_html(
+                    _reset_password_page(token, error=str(error)),
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            except ValueError as error:
+                self._send_html(
+                    _reset_password_page(token, error=str(error)),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+
+            if not changed:
+                self._send_html(
+                    _forgot_password_page(error="Reset link is invalid or expired."),
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+
+            self._send_html(
+                _login_page(info="Password updated successfully. Sign in with your new password."),
+                status=HTTPStatus.OK,
+            )
             return
 
         client_ip = self.client_address[0]
@@ -393,11 +616,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(length).decode("utf-8")
-        fields = parse_qs(raw_body)
         username = fields.get("username", [""])[0]
         password = fields.get("password", [""])[0]
+
+        if self.server.store.authenticate_user(username=username, password=password):
+            session_id = secrets.token_hex(16)
+            self.server.sessions[session_id] = time.time() + SESSION_TTL_SECONDS
+            self.server.login_attempts.pop(client_ip, None)
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", f"ids_session={session_id}; Path=/; HttpOnly")
+            self.end_headers()
+            return
 
         if username == self.server.config.dashboard.username and verify_password(
             password=password,
@@ -416,7 +646,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._record_failed_attempt(client_ip)
         self._send_html(
             _login_page(
-                error="Invalid username or password.",
+                error="Invalid username/password or account is not verified.",
                 warning=self._demo_warning(),
             ),
             status=HTTPStatus.UNAUTHORIZED,
@@ -485,6 +715,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _read_form_fields(self) -> dict[str, list[str]]:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length).decode("utf-8")
+        return parse_qs(raw_body)
+
+    def _request_origin(self) -> str:
+        host = self.headers.get("Host", "127.0.0.1")
+        return f"http://{host}"
 
     def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -579,14 +818,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
 
     def _demo_warning(self) -> str:
-        if not (
-            self.server.config.dashboard.username.strip()
-            and self.server.config.dashboard.password_hash.strip()
-        ):
+        if not self.server.store.has_verified_users():
             return (
-                "Dashboard credentials are not configured. "
-                "Set IDS_DASHBOARD_USERNAME plus IDS_DASHBOARD_PASSWORD "
-                "or IDS_DASHBOARD_PASSWORD_HASH before deployment."
+                "No verified user accounts found. "
+                "Create an account and verify your email before signing in."
             )
         return ""
 
@@ -623,11 +858,10 @@ def run_dashboard(
     debug: bool,
 ) -> None:
     _ = debug
-    if not (config.dashboard.username.strip() and config.dashboard.password_hash.strip()):
+    if not store.has_verified_users():
         print(
-            "Warning: dashboard credentials are not configured. "
-            "Set IDS_DASHBOARD_USERNAME plus IDS_DASHBOARD_PASSWORD "
-            "or IDS_DASHBOARD_PASSWORD_HASH before deployment."
+            "Warning: no verified user accounts exist. "
+            "Register a user and verify email before signing in."
         )
     server = create_server(config=config, store=store, host=host, port=port)
     print(f"Dashboard running on http://{host}:{port}")
