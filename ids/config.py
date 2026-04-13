@@ -70,9 +70,9 @@ DEFAULT_CONFIG = {
         "poll_interval_seconds": 5,
     },
     "dashboard": {
-        "username": "admin",
-        "password_hash": "4e7a94a1b8ac55d23c40cd3ce4c4d0e670add71b012de74799ae71c5715de547",
-        "password_salt": "ids-demo-salt",
+        "username": "",
+        "password_hash": "",
+        "password_salt": "change-this-password-salt",
         "secret_key": "change-this-secret-key",
     },
     "response": {
@@ -82,13 +82,6 @@ DEFAULT_CONFIG = {
         "blocked_ips": [],
     },
 }
-
-DEFAULT_DASHBOARD_PASSWORD = "admin123"
-DEFAULT_DASHBOARD_PASSWORD_HASH = hash_password(
-    DEFAULT_DASHBOARD_PASSWORD,
-    DEFAULT_CONFIG["dashboard"]["password_salt"],
-)
-
 
 def ensure_config_file(path: Path) -> None:
     if path.exists():

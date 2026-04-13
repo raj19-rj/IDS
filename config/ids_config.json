@@ -14,9 +14,9 @@
     "poll_interval_seconds": 5
   },
   "dashboard": {
-    "username": "admin",
-    "password_hash": "4e7a94a1b8ac55d23c40cd3ce4c4d0e670add71b012de74799ae71c5715de547",
-    "password_salt": "ids-demo-salt",
+    "username": "",
+    "password_hash": "",
+    "password_salt": "change-this-password-salt",
     "secret_key": "change-this-secret-key"
   },
   "response": {

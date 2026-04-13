@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import json
+import sqlite3
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,11 @@ from ids.config import (
 from ids.models import Alert
 from ids.storage import AlertStore
 from ids.web import create_server
+
+try:
+    import bcrypt as _bcrypt
+except ImportError:
+    _bcrypt = None
 
 
 class StorageAndWebTests(unittest.TestCase):
@@ -260,6 +266,48 @@ class StorageAndWebTests(unittest.TestCase):
         alerts = self.store.list_alerts()
 
         self.assertEqual(alerts[0]["rule_name"], "Port Scan")
+
+    def test_users_table_exists_with_expected_columns(self) -> None:
+        connection = sqlite3.connect(self.store.database_path)
+        try:
+            columns = connection.execute("PRAGMA table_info(users)").fetchall()
+        finally:
+            connection.close()
+
+        column_names = {str(column[1]) for column in columns}
+        self.assertIn("username", column_names)
+        self.assertIn("password_hash", column_names)
+        self.assertIn("password_salt", column_names)
+        self.assertIn("created_at", column_names)
+
+    def test_create_user_and_verify_password(self) -> None:
+        if _bcrypt is None:
+            self.skipTest("bcrypt is not installed")
+        created = self.store.create_user("analyst", "StrongPassword!123")
+
+        self.assertTrue(created)
+        self.assertTrue(self.store.verify_user_password("analyst", "StrongPassword!123"))
+        self.assertFalse(self.store.verify_user_password("analyst", "wrong-password"))
+
+    def test_same_password_uses_distinct_salted_hashes(self) -> None:
+        if _bcrypt is None:
+            self.skipTest("bcrypt is not installed")
+        self.assertTrue(self.store.create_user("alice", "SharedSecret!"))
+        self.assertTrue(self.store.create_user("bob", "SharedSecret!"))
+
+        connection = sqlite3.connect(self.store.database_path)
+        try:
+            rows = connection.execute(
+                "SELECT username, password_hash, password_salt FROM users WHERE username IN (?, ?)",
+                ("alice", "bob"),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(rows), 2)
+        users = {str(row[0]): {"hash": str(row[1]), "salt": str(row[2])} for row in rows}
+        self.assertNotEqual(users["alice"]["salt"], users["bob"]["salt"])
+        self.assertNotEqual(users["alice"]["hash"], users["bob"]["hash"])
 
 
 if __name__ == "__main__":

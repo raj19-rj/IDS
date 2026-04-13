@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import secrets
 import sqlite3
 import tempfile
 from collections import Counter
@@ -12,6 +13,11 @@ from pathlib import Path
 from threading import RLock
 
 from ids.models import Alert
+
+try:
+    import bcrypt
+except ImportError:  # pragma: no cover - exercised only when dependency is missing
+    bcrypt = None
 
 
 class AlertStore:
@@ -72,6 +78,57 @@ class AlertStore:
             )
             connection.commit()
             return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def create_user(self, username: str, password: str) -> bool:
+        self._require_bcrypt()
+        normalized_username = username.strip()
+        if not normalized_username:
+            raise ValueError("username cannot be empty")
+        if not password:
+            raise ValueError("password cannot be empty")
+
+        password_salt = secrets.token_hex(16)
+        salted_password = f"{password_salt}:{password}".encode("utf-8")
+        password_hash = bcrypt.hashpw(salted_password, bcrypt.gensalt()).decode("utf-8")
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO users (username, password_hash, password_salt, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (normalized_username, password_hash, password_salt, created_at),
+                )
+                connection.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def verify_user_password(self, username: str, password: str) -> bool:
+        self._require_bcrypt()
+        normalized_username = username.strip()
+        if not normalized_username or not password:
+            return False
+
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                SELECT password_hash, password_salt
+                FROM users
+                WHERE username = ?
+                """,
+                (normalized_username,),
+            )
+            row = cursor.fetchone()
+
+        if row is None:
+            return False
+
+        stored_hash = str(row["password_hash"]).encode("utf-8")
+        salted_password = f"{row['password_salt']}:{password}".encode("utf-8")
+        return bcrypt.checkpw(salted_password, stored_hash)
 
     def list_alerts(
         self,
@@ -415,10 +472,22 @@ class AlertStore:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_src_ip ON alerts(src_ip)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_rule_name ON alerts(rule_name)")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
     def _migrate_legacy_jsonl(self, legacy_path: Path) -> None:
         if not legacy_path.exists():
@@ -545,3 +614,10 @@ class AlertStore:
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
+
+    def _require_bcrypt(self) -> None:
+        if bcrypt is None:
+            raise RuntimeError(
+                "bcrypt is required for user password operations. "
+                "Install dependencies from requirements.txt."
+            )

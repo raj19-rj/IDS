@@ -11,7 +11,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from ids.config import DEFAULT_DASHBOARD_PASSWORD_HASH, IDSConfig
+from ids.config import IDSConfig
 from ids.security import verify_password
 from ids.storage import AlertStore
 
@@ -579,10 +579,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
 
     def _demo_warning(self) -> str:
-        if self.server.config.dashboard.password_hash == DEFAULT_DASHBOARD_PASSWORD_HASH:
+        if not (
+            self.server.config.dashboard.username.strip()
+            and self.server.config.dashboard.password_hash.strip()
+        ):
             return (
-                "Dashboard is using the demo password. "
-                "Set IDS_DASHBOARD_PASSWORD or IDS_DASHBOARD_PASSWORD_HASH before deployment."
+                "Dashboard credentials are not configured. "
+                "Set IDS_DASHBOARD_USERNAME plus IDS_DASHBOARD_PASSWORD "
+                "or IDS_DASHBOARD_PASSWORD_HASH before deployment."
             )
         return ""
 
@@ -619,10 +623,11 @@ def run_dashboard(
     debug: bool,
 ) -> None:
     _ = debug
-    if config.dashboard.password_hash == DEFAULT_DASHBOARD_PASSWORD_HASH:
+    if not (config.dashboard.username.strip() and config.dashboard.password_hash.strip()):
         print(
-            "Warning: dashboard is using the demo password. "
-            "Set IDS_DASHBOARD_PASSWORD or IDS_DASHBOARD_PASSWORD_HASH before deployment."
+            "Warning: dashboard credentials are not configured. "
+            "Set IDS_DASHBOARD_USERNAME plus IDS_DASHBOARD_PASSWORD "
+            "or IDS_DASHBOARD_PASSWORD_HASH before deployment."
         )
     server = create_server(config=config, store=store, host=host, port=port)
     print(f"Dashboard running on http://{host}:{port}")
