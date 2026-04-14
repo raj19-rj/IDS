@@ -79,6 +79,39 @@ class StorageAndWebTests(unittest.TestCase):
         self.assertIsNotNone(server)
         server.server_close()
 
+    def test_dashboard_server_can_enable_https_redirect_flag(self) -> None:
+        server = create_server(
+            self.config,
+            self.store,
+            host="127.0.0.1",
+            port=0,
+            trust_proxy_headers=True,
+            force_https_redirect=True,
+        )
+        self.assertTrue(server.trust_proxy_headers)
+        self.assertTrue(server.force_https_redirect)
+        server.server_close()
+
+    def test_dashboard_tls_requires_cert_and_key_together(self) -> None:
+        with self.assertRaises(ValueError):
+            create_server(
+                self.config,
+                self.store,
+                host="127.0.0.1",
+                port=0,
+                tls_cert_path=Path("certs/server.crt"),
+                tls_key_path=None,
+            )
+        with self.assertRaises(ValueError):
+            create_server(
+                self.config,
+                self.store,
+                host="127.0.0.1",
+                port=0,
+                tls_cert_path=None,
+                tls_key_path=Path("certs/server.key"),
+            )
+
     def test_export_alerts_to_json(self) -> None:
         alert = Alert(
             timestamp=datetime(2026, 4, 1, 12, 0, 0),

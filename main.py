@@ -85,6 +85,31 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--host", default="127.0.0.1", help="Dashboard host")
     dashboard.add_argument("--port", type=int, default=5000, help="Dashboard port")
     dashboard.add_argument("--debug", action="store_true", help="Enable debug mode")
+    dashboard.add_argument(
+        "--tls-cert",
+        type=Path,
+        default=None,
+        help="Path to TLS certificate file (PEM). Requires --tls-key.",
+    )
+    dashboard.add_argument(
+        "--tls-key",
+        type=Path,
+        default=None,
+        help="Path to TLS private key file (PEM). Requires --tls-cert.",
+    )
+    dashboard.add_argument(
+        "--trust-proxy-headers",
+        action="store_true",
+        help=(
+            "Honor X-Forwarded-Proto/X-Forwarded-Host for HTTPS origin and Secure cookies "
+            "(use only behind a trusted reverse proxy such as Nginx)."
+        ),
+    )
+    dashboard.add_argument(
+        "--force-https-redirect",
+        action="store_true",
+        help="Redirect all non-HTTPS requests to HTTPS with HTTP 308.",
+    )
     dashboard.add_argument("--input", type=Path, help="Optional log file to monitor live")
     dashboard.add_argument(
         "--format",
@@ -196,6 +221,10 @@ def command_dashboard(
     host: str,
     port: int,
     debug: bool,
+    tls_cert: Path | None,
+    tls_key: Path | None,
+    trust_proxy_headers: bool,
+    force_https_redirect: bool,
     input_path: Path | None,
     input_format: str,
     live: bool,
@@ -229,7 +258,17 @@ def command_dashboard(
         )
         thread.start()
         print("Background monitor started for the dashboard.")
-    run_dashboard(config=config, store=store, host=host, port=port, debug=debug)
+    run_dashboard(
+        config=config,
+        store=store,
+        host=host,
+        port=port,
+        debug=debug,
+        tls_cert_path=tls_cert,
+        tls_key_path=tls_key,
+        trust_proxy_headers=trust_proxy_headers,
+        force_https_redirect=force_https_redirect,
+    )
     return 0
 
 
@@ -272,6 +311,10 @@ def main() -> int:
             args.host,
             args.port,
             args.debug,
+            args.tls_cert,
+            args.tls_key,
+            args.trust_proxy_headers,
+            args.force_https_redirect,
             args.input,
             args.format,
             args.live,

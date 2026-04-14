@@ -174,6 +174,48 @@ Run the dashboard with live packet capture:
 python main.py dashboard --live --interface Ethernet
 ```
 
+Run the dashboard with HTTPS/TLS directly (PEM certificate + key):
+
+```bash
+python main.py dashboard --host 0.0.0.0 --port 5443 --tls-cert certs/server.crt --tls-key certs/server.key
+```
+
+Then open `https://127.0.0.1:5443`
+
+Run behind Nginx TLS termination:
+
+1. Start dashboard on localhost with proxy trust enabled:
+
+```bash
+python main.py dashboard --host 127.0.0.1 --port 5000 --trust-proxy-headers --force-https-redirect
+```
+
+2. Put Nginx in front (example):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ids.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/ids.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ids.example.com/privkey.pem;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:5000;
+    }
+}
+```
+
+Notes:
+
+- `--tls-cert` and `--tls-key` must be provided together.
+- `--trust-proxy-headers` should only be used when traffic reaches the app through a trusted reverse proxy.
+- `--force-https-redirect` sends `308 Permanent Redirect` for any non-HTTPS request.
+
 ## Export Alerts
 
 Export stored alerts to CSV:
@@ -267,4 +309,4 @@ python -m unittest discover -s tests
 - This is now a stronger MVP, but it still needs hardening before production.
 - Replace the demo dashboard password and secret key.
 - Firewall automation may require administrator rights.
-- For enterprise use, add stronger auth, HTTPS, audit logs, and integrations with real network devices.
+- For enterprise use, continue hardening auth and authorization, add audit logs, and integrate with real network devices.

@@ -355,53 +355,79 @@ class AlertStore:
     def store_refresh_token(self, username: str, refresh_token: str, expires_at_epoch: int) -> None:
         token_hash = self._hash_token(refresh_token)
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock, self._connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO refresh_tokens (
-                    token_hash, username, expires_at_epoch, created_at, revoked_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (token_hash, username.strip(), int(expires_at_epoch), now, None),
-            )
-            connection.commit()
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO refresh_tokens (
+                        token_hash, username, expires_at_epoch, created_at, revoked_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (token_hash, username.strip(), int(expires_at_epoch), now, None),
+                )
+                connection.commit()
+        except sqlite3.OperationalError as error:
+            if "no such table: refresh_tokens" not in str(error).lower():
+                raise
+            self._repair_missing_refresh_tokens_table()
+            with self._lock, self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO refresh_tokens (
+                        token_hash, username, expires_at_epoch, created_at, revoked_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (token_hash, username.strip(), int(expires_at_epoch), now, None),
+                )
+                connection.commit()
 
     def consume_refresh_token(self, refresh_token: str) -> str | None:
         token_hash = self._hash_token(refresh_token)
         now_epoch = int(time.time())
         revoked_at = datetime.now(timezone.utc).isoformat()
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT token_hash, username, expires_at_epoch, revoked_at
-                FROM refresh_tokens
-                WHERE token_hash = ?
-                LIMIT 1
-                """,
-                (token_hash,),
-            ).fetchone()
-            if row is None:
-                return None
-            if row["revoked_at"] is not None:
-                return None
-            if int(row["expires_at_epoch"]) <= now_epoch:
-                return None
-            connection.execute(
-                "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?",
-                (revoked_at, token_hash),
-            )
-            connection.commit()
-            return str(row["username"])
+        try:
+            with self._lock, self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT token_hash, username, expires_at_epoch, revoked_at
+                    FROM refresh_tokens
+                    WHERE token_hash = ?
+                    LIMIT 1
+                    """,
+                    (token_hash,),
+                ).fetchone()
+                if row is None:
+                    return None
+                if row["revoked_at"] is not None:
+                    return None
+                if int(row["expires_at_epoch"]) <= now_epoch:
+                    return None
+                connection.execute(
+                    "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?",
+                    (revoked_at, token_hash),
+                )
+                connection.commit()
+                return str(row["username"])
+        except sqlite3.OperationalError as error:
+            if "no such table: refresh_tokens" not in str(error).lower():
+                raise
+            self._repair_missing_refresh_tokens_table()
+            return None
 
     def revoke_refresh_token(self, refresh_token: str) -> None:
         token_hash = self._hash_token(refresh_token)
         revoked_at = datetime.now(timezone.utc).isoformat()
-        with self._lock, self._connection() as connection:
-            connection.execute(
-                "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?",
-                (revoked_at, token_hash),
-            )
-            connection.commit()
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute(
+                    "UPDATE refresh_tokens SET revoked_at = ? WHERE token_hash = ?",
+                    (revoked_at, token_hash),
+                )
+                connection.commit()
+        except sqlite3.OperationalError as error:
+            if "no such table: refresh_tokens" not in str(error).lower():
+                raise
+            self._repair_missing_refresh_tokens_table()
 
     def queue_outbound_email(self, recipient_email: str, subject: str, body: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -1150,6 +1176,27 @@ class AlertStore:
             "UPDATE users SET role = ? WHERE id = ?",
             (ROLE_ADMIN, int(oldest_verified["id"])),
         )
+
+    def _repair_missing_refresh_tokens_table(self) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS refresh_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    expires_at_epoch INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_username ON refresh_tokens(username)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expiry ON refresh_tokens(expires_at_epoch)"
+            )
+            connection.commit()
 
     def _hash_token(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()

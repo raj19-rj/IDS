@@ -4,11 +4,13 @@ import csv
 import io
 import json
 import secrets
+import ssl
 import time
 from html import escape
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from ids.config import IDSConfig
@@ -347,19 +349,41 @@ def _alert_detail_page(alert: dict[str, object]) -> str:
 
 
 class DashboardServer(ThreadingHTTPServer):
-    def __init__(self, server_address: tuple[str, int], config: IDSConfig, store: AlertStore):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        config: IDSConfig,
+        store: AlertStore,
+        *,
+        use_https: bool = False,
+        trust_proxy_headers: bool = False,
+        force_https_redirect: bool = False,
+    ):
         super().__init__(server_address, DashboardHandler)
         self.config = config
         self.store = store
         self.login_attempts: dict[str, list[float]] = {}
+        self.use_https = use_https
+        self.trust_proxy_headers = trust_proxy_headers
+        self.force_https_redirect = force_https_redirect
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
     server: DashboardServer
 
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self._is_https_request():
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        super().end_headers()
+
     def do_GET(self) -> None:
         self._auth_context: dict[str, str] | None = None
         self._pending_cookies: list[str] = []
+        if self._enforce_https_redirect():
+            return
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -407,11 +431,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/login")
             self.send_header(
                 "Set-Cookie",
-                f"{ACCESS_TOKEN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+                f"{ACCESS_TOKEN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{self._cookie_security_attrs()}",
             )
             self.send_header(
                 "Set-Cookie",
-                f"{REFRESH_TOKEN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+                f"{REFRESH_TOKEN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{self._cookie_security_attrs()}",
             )
             self.end_headers()
             return
@@ -536,6 +560,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._auth_context = None
         self._pending_cookies = []
+        if self._enforce_https_redirect():
+            return
         if self.path == "/api/alerts/ack":
             if not self._is_authenticated():
                 self._send_json({"error": "Authentication required."}, status=HTTPStatus.UNAUTHORIZED)
@@ -803,7 +829,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _request_origin(self) -> str:
         host = self.headers.get("Host", "127.0.0.1")
-        return f"http://{host}"
+        if self.server.trust_proxy_headers:
+            forwarded_host = self.headers.get("X-Forwarded-Host", "").strip()
+            if forwarded_host:
+                host = forwarded_host.split(",")[0].strip()
+        scheme = "https" if self._is_https_request() else "http"
+        return f"{scheme}://{host}"
 
     def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -859,10 +890,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _queue_auth_cookies(self, *, access_token: str, refresh_token: str) -> None:
         self._pending_cookies.append(
-            f"{ACCESS_TOKEN_COOKIE}={access_token}; Path=/; HttpOnly; SameSite=Lax"
+            f"{ACCESS_TOKEN_COOKIE}={access_token}; Path=/; HttpOnly; SameSite=Lax{self._cookie_security_attrs()}"
         )
         self._pending_cookies.append(
-            f"{REFRESH_TOKEN_COOKIE}={refresh_token}; Path=/; HttpOnly; SameSite=Lax"
+            f"{REFRESH_TOKEN_COOKIE}={refresh_token}; Path=/; HttpOnly; SameSite=Lax{self._cookie_security_attrs()}"
         )
 
     def _apply_pending_cookies(self) -> None:
@@ -1047,9 +1078,86 @@ class DashboardHandler(BaseHTTPRequestHandler):
         attempts.append(now)
         self.server.login_attempts[client_ip] = attempts
 
+    def _is_https_request(self) -> bool:
+        if self.server.use_https:
+            return True
+        if not self.server.trust_proxy_headers:
+            return False
+        forwarded_proto = self.headers.get("X-Forwarded-Proto", "").strip().lower()
+        if not forwarded_proto:
+            return False
+        first = forwarded_proto.split(",")[0].strip()
+        return first == "https"
 
-def create_server(config: IDSConfig, store: AlertStore, host: str, port: int) -> DashboardServer:
-    return DashboardServer((host, port), config=config, store=store)
+    def _cookie_security_attrs(self) -> str:
+        return "; Secure" if self._is_https_request() else ""
+
+    def _enforce_https_redirect(self) -> bool:
+        if not self.server.force_https_redirect:
+            return False
+        if self._is_https_request():
+            return False
+        self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+        self.send_header("Location", self._https_redirect_target())
+        self.end_headers()
+        return True
+
+    def _https_redirect_target(self) -> str:
+        host = self.headers.get("Host", "127.0.0.1")
+        if self.server.trust_proxy_headers:
+            forwarded_host = self.headers.get("X-Forwarded-Host", "").strip()
+            if forwarded_host:
+                host = forwarded_host.split(",")[0].strip()
+        normalized_host = self._normalize_https_host(host)
+        return f"https://{normalized_host}{self.path}"
+
+    def _normalize_https_host(self, host: str) -> str:
+        value = host.strip()
+        if not value:
+            return "127.0.0.1"
+        if value.startswith("["):
+            closing_bracket = value.find("]")
+            if closing_bracket > -1 and value[closing_bracket + 1 :] == ":80":
+                return f"{value[:closing_bracket + 1]}:443"
+            return value
+        if ":" in value:
+            host_part, port_part = value.rsplit(":", 1)
+            if port_part == "80":
+                return f"{host_part}:443"
+        return value
+
+
+def create_server(
+    config: IDSConfig,
+    store: AlertStore,
+    host: str,
+    port: int,
+    tls_cert_path: Path | None = None,
+    tls_key_path: Path | None = None,
+    *,
+    trust_proxy_headers: bool = False,
+    force_https_redirect: bool = False,
+) -> DashboardServer:
+    if (tls_cert_path is None) != (tls_key_path is None):
+        raise ValueError("Both tls_cert_path and tls_key_path are required to enable HTTPS.")
+
+    use_https = tls_cert_path is not None and tls_key_path is not None
+    server = DashboardServer(
+        (host, port),
+        config=config,
+        store=store,
+        use_https=use_https,
+        trust_proxy_headers=trust_proxy_headers,
+        force_https_redirect=force_https_redirect,
+    )
+    if use_https:
+        assert tls_cert_path is not None
+        assert tls_key_path is not None
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(certfile=str(tls_cert_path), keyfile=str(tls_key_path))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    return server
 
 
 def run_dashboard(
@@ -1058,6 +1166,11 @@ def run_dashboard(
     host: str,
     port: int,
     debug: bool,
+    tls_cert_path: Path | None = None,
+    tls_key_path: Path | None = None,
+    *,
+    trust_proxy_headers: bool = False,
+    force_https_redirect: bool = False,
 ) -> None:
     _ = debug
     if not store.has_verified_users():
@@ -1065,6 +1178,20 @@ def run_dashboard(
             "Warning: no verified user accounts exist. "
             "Register a user and verify email before signing in."
         )
-    server = create_server(config=config, store=store, host=host, port=port)
-    print(f"Dashboard running on http://{host}:{port}")
+    server = create_server(
+        config=config,
+        store=store,
+        host=host,
+        port=port,
+        tls_cert_path=tls_cert_path,
+        tls_key_path=tls_key_path,
+        trust_proxy_headers=trust_proxy_headers,
+        force_https_redirect=force_https_redirect,
+    )
+    scheme = "https" if server.use_https else "http"
+    print(f"Dashboard running on {scheme}://{host}:{port}")
+    if trust_proxy_headers and not server.use_https:
+        print("Proxy mode enabled: honoring X-Forwarded-Proto/X-Forwarded-Host headers.")
+    if force_https_redirect:
+        print("HTTPS redirect is enabled for non-TLS requests.")
     server.serve_forever()
